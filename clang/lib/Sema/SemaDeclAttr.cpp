@@ -8581,6 +8581,9 @@ static void ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D,
   case ParsedAttr::AT_InternalLinkage:
     handleInternalLinkageAttr(S, D, AL);
     break;
+  case ParsedAttr::AT_Syntax:
+    // This was handled during parsing.
+    break;
 
   // Microsoft attributes:
   case ParsedAttr::AT_LayoutVersion:
