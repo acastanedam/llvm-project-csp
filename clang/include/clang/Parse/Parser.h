@@ -3516,7 +3516,6 @@ class SyntaxHandler {
   std::string Name;
 
   virtual void anchor();
-
 public:
   SyntaxHandler() = default;
   explicit SyntaxHandler(StringRef name) : Name(name) {}
@@ -3527,6 +3526,8 @@ public:
                               CachedTokens &Toks,
                               llvm::raw_string_ostream &OS) = 0;
   virtual void AddToPredefines(llvm::raw_string_ostream &OS) = 0;
+  /// Utility function returns actual text of a declarator.
+  StringRef getDeclText(Preprocessor &PP,Declarator &D);
 };
 
 /// Registry of syntax handlers added by plugins
