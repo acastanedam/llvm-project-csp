@@ -24,6 +24,8 @@ static cl::opt<TargetLibraryInfoImpl::VectorLibrary> ClVectorLibrary(
                           "No vector functions library"),
                clEnumValN(TargetLibraryInfoImpl::Accelerate, "Accelerate",
                           "Accelerate framework"),
+               clEnumValN(TargetLibraryInfoImpl::LIBMVEC_X86, "LIBMVEC-X86",
+                          "GLIBC Vector Math library"),
                clEnumValN(TargetLibraryInfoImpl::MASSV, "MASSV",
                           "IBM MASS vector library"),
                clEnumValN(TargetLibraryInfoImpl::SVML, "SVML",
@@ -69,11 +71,10 @@ static bool hasBcmp(const Triple &TT) {
 static void initialize(TargetLibraryInfoImpl &TLI, const Triple &T,
                        ArrayRef<StringLiteral> StandardNames) {
   // Verify that the StandardNames array is in alphabetical order.
-  assert(std::is_sorted(StandardNames.begin(), StandardNames.end(),
-                        [](StringRef LHS, StringRef RHS) {
-                          return LHS < RHS;
-                        }) &&
-         "TargetLibraryInfoImpl function names must be sorted");
+  assert(
+      llvm::is_sorted(StandardNames,
+                      [](StringRef LHS, StringRef RHS) { return LHS < RHS; }) &&
+      "TargetLibraryInfoImpl function names must be sorted");
 
   // Set IO unlocked variants as unavailable
   // Set them as available per system below
@@ -105,14 +106,12 @@ static void initialize(TargetLibraryInfoImpl &TLI, const Triple &T,
   TLI.setShouldExtI32Return(ShouldExtI32Return);
   TLI.setShouldSignExtI32Param(ShouldSignExtI32Param);
 
-  if (T.getArch() == Triple::r600 ||
-      T.getArch() == Triple::amdgcn)
+  if (T.isAMDGPU())
     TLI.disableAllFunctions();
 
   // There are no library implementations of memcpy and memset for AMD gpus and
   // these can be difficult to lower in the backend.
-  if (T.getArch() == Triple::r600 ||
-      T.getArch() == Triple::amdgcn) {
+  if (T.isAMDGPU()) {
     TLI.setUnavailable(LibFunc_memcpy);
     TLI.setUnavailable(LibFunc_memset);
     TLI.setUnavailable(LibFunc_memset_pattern16);
@@ -210,6 +209,7 @@ static void initialize(TargetLibraryInfoImpl &TLI, const Triple &T,
       TLI.setUnavailable(LibFunc_logf);
       TLI.setUnavailable(LibFunc_modff);
       TLI.setUnavailable(LibFunc_powf);
+      TLI.setUnavailable(LibFunc_remainderf);
       TLI.setUnavailable(LibFunc_sinf);
       TLI.setUnavailable(LibFunc_sinhf);
       TLI.setUnavailable(LibFunc_sqrtf);
@@ -239,6 +239,7 @@ static void initialize(TargetLibraryInfoImpl &TLI, const Triple &T,
     TLI.setUnavailable(LibFunc_logl);
     TLI.setUnavailable(LibFunc_modfl);
     TLI.setUnavailable(LibFunc_powl);
+    TLI.setUnavailable(LibFunc_remainderl);
     TLI.setUnavailable(LibFunc_sinl);
     TLI.setUnavailable(LibFunc_sinhl);
     TLI.setUnavailable(LibFunc_sqrtl);
@@ -379,10 +380,8 @@ static void initialize(TargetLibraryInfoImpl &TLI, const Triple &T,
   case Triple::TvOS:
   case Triple::WatchOS:
     TLI.setUnavailable(LibFunc_exp10l);
-    if (!T.isWatchOS() && (T.isOSVersionLT(7, 0) ||
-                           (T.isOSVersionLT(9, 0) &&
-                            (T.getArch() == Triple::x86 ||
-                             T.getArch() == Triple::x86_64)))) {
+    if (!T.isWatchOS() &&
+        (T.isOSVersionLT(7, 0) || (T.isOSVersionLT(9, 0) && T.isX86()))) {
       TLI.setUnavailable(LibFunc_exp10);
       TLI.setUnavailable(LibFunc_exp10f);
     } else {
@@ -472,6 +471,9 @@ static void initialize(TargetLibraryInfoImpl &TLI, const Triple &T,
     TLI.setUnavailable(LibFunc_tmpfile64);
 
     // Relaxed math functions are included in math-finite.h on Linux (GLIBC).
+    // Note that math-finite.h is no longer supported by top-of-tree GLIBC,
+    // so we keep these functions around just so that they're recognized by
+    // the ConstantFolder.
     TLI.setUnavailable(LibFunc_acos_finite);
     TLI.setUnavailable(LibFunc_acosf_finite);
     TLI.setUnavailable(LibFunc_acosl_finite);
@@ -636,7 +638,7 @@ bool TargetLibraryInfoImpl::isValidProtoForLibFunc(const FunctionType &FTy,
                                                    const DataLayout *DL) const {
   LLVMContext &Ctx = FTy.getContext();
   Type *PCharTy = Type::getInt8PtrTy(Ctx);
-  Type *SizeTTy = DL ? DL->getIntPtrType(Ctx, /*AS=*/0) : nullptr;
+  Type *SizeTTy = DL ? DL->getIntPtrType(Ctx, /*AddressSpace=*/0) : nullptr;
   auto IsSizeTTy = [SizeTTy](Type *Ty) {
     return SizeTTy ? Ty == SizeTTy : Ty->isIntegerTy();
   };
@@ -661,6 +663,11 @@ bool TargetLibraryInfoImpl::isValidProtoForLibFunc(const FunctionType &FTy,
             FTy.getParamType(1)->isPointerTy() &&
             FTy.getParamType(2)->isPointerTy() &&
             FTy.getReturnType()->isIntegerTy(32));
+  case LibFunc_strlen_chk:
+    --NumParams;
+    if (!IsSizeTTy(FTy.getParamType(NumParams)))
+      return false;
+    LLVM_FALLTHROUGH;
   case LibFunc_strlen:
     return (NumParams == 1 && FTy.getParamType(0)->isPointerTy() &&
             FTy.getReturnType()->isIntegerTy());
@@ -842,6 +849,7 @@ bool TargetLibraryInfoImpl::isValidProtoForLibFunc(const FunctionType &FTy,
     return (NumParams >= 2 && FTy.getParamType(1)->isPointerTy());
 
   case LibFunc_memcpy_chk:
+  case LibFunc_mempcpy_chk:
   case LibFunc_memmove_chk:
     --NumParams;
     if (!IsSizeTTy(FTy.getParamType(NumParams)))
@@ -895,6 +903,8 @@ bool TargetLibraryInfoImpl::isValidProtoForLibFunc(const FunctionType &FTy,
             FTy.getParamType(1)->isPointerTy());
   case LibFunc_write:
     return (NumParams == 3 && FTy.getParamType(1)->isPointerTy());
+  case LibFunc_aligned_alloc:
+    return (NumParams == 2 && FTy.getReturnType()->isPointerTy());
   case LibFunc_bcopy:
   case LibFunc_bcmp:
     return (NumParams == 3 && FTy.getParamType(0)->isPointerTy() &&
@@ -1211,7 +1221,24 @@ bool TargetLibraryInfoImpl::isValidProtoForLibFunc(const FunctionType &FTy,
   case LibFunc_ZdlPvSt11align_val_tRKSt9nothrow_t:
   // void operator delete[](void*, align_val_t, nothrow)
   case LibFunc_ZdaPvSt11align_val_tRKSt9nothrow_t:
+  // void operator delete(void*, unsigned int, align_val_t)
+  case LibFunc_ZdlPvjSt11align_val_t:
+  // void operator delete(void*, unsigned long, align_val_t)
+  case LibFunc_ZdlPvmSt11align_val_t:
+  // void operator delete[](void*, unsigned int, align_val_t);
+  case LibFunc_ZdaPvjSt11align_val_t:
+  // void operator delete[](void*, unsigned long, align_val_t);
+  case LibFunc_ZdaPvmSt11align_val_t:
     return (NumParams == 3 && FTy.getParamType(0)->isPointerTy());
+
+  // void __atomic_load(size_t, void *, void *, int)
+  case LibFunc_atomic_load:
+  // void __atomic_store(size_t, void *, void *, int)
+  case LibFunc_atomic_store:
+    return (NumParams == 4 && FTy.getParamType(0)->isIntegerTy() &&
+            FTy.getParamType(1)->isPointerTy() &&
+            FTy.getParamType(2)->isPointerTy() &&
+            FTy.getParamType(3)->isIntegerTy());
 
   case LibFunc_memset_pattern16:
     return (!FTy.isVarArg() && NumParams == 3 &&
@@ -1334,6 +1361,9 @@ bool TargetLibraryInfoImpl::isValidProtoForLibFunc(const FunctionType &FTy,
   case LibFunc_round:
   case LibFunc_roundf:
   case LibFunc_roundl:
+  case LibFunc_roundeven:
+  case LibFunc_roundevenf:
+  case LibFunc_roundevenl:
   case LibFunc_sin:
   case LibFunc_sinf:
   case LibFunc_sinh:
@@ -1376,6 +1406,9 @@ bool TargetLibraryInfoImpl::isValidProtoForLibFunc(const FunctionType &FTy,
   case LibFunc_fmod:
   case LibFunc_fmodf:
   case LibFunc_fmodl:
+  case LibFunc_remainder:
+  case LibFunc_remainderf:
+  case LibFunc_remainderl:
   case LibFunc_copysign:
   case LibFunc_copysignf:
   case LibFunc_copysignl:
@@ -1480,9 +1513,9 @@ bool TargetLibraryInfoImpl::getLibFunc(const Function &FDecl,
                                        LibFunc &F) const {
   // Intrinsics don't overlap w/libcalls; if our module has a large number of
   // intrinsics, this ends up being an interesting compile time win since we
-  // avoid string normalization and comparison. 
+  // avoid string normalization and comparison.
   if (FDecl.isIntrinsic()) return false;
-  
+
   const DataLayout *DL =
       FDecl.getParent() ? &FDecl.getParent()->getDataLayout() : nullptr;
   return getLibFunc(FDecl.getName(), F) &&
@@ -1510,10 +1543,10 @@ static bool compareWithVectorFnName(const VecDesc &LHS, StringRef S) {
 }
 
 void TargetLibraryInfoImpl::addVectorizableFunctions(ArrayRef<VecDesc> Fns) {
-  VectorDescs.insert(VectorDescs.end(), Fns.begin(), Fns.end());
+  llvm::append_range(VectorDescs, Fns);
   llvm::sort(VectorDescs, compareByScalarFnName);
 
-  ScalarDescs.insert(ScalarDescs.end(), Fns.begin(), Fns.end());
+  llvm::append_range(ScalarDescs, Fns);
   llvm::sort(ScalarDescs, compareByVectorFnName);
 }
 
@@ -1523,6 +1556,14 @@ void TargetLibraryInfoImpl::addVectorizableFunctionsFromVecLib(
   case Accelerate: {
     const VecDesc VecFuncs[] = {
     #define TLI_DEFINE_ACCELERATE_VECFUNCS
+    #include "llvm/Analysis/VecFuncs.def"
+    };
+    addVectorizableFunctions(VecFuncs);
+    break;
+  }
+  case LIBMVEC_X86: {
+    const VecDesc VecFuncs[] = {
+    #define TLI_DEFINE_LIBMVEC_X86_VECFUNCS
     #include "llvm/Analysis/VecFuncs.def"
     };
     addVectorizableFunctions(VecFuncs);

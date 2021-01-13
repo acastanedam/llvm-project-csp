@@ -43,6 +43,15 @@ bool HelpQuery::run(llvm::raw_ostream &OS, QuerySession &QS) const {
         "Set whether to bind the root matcher to \"root\".\n"
         "  set print-matcher (true|false)    "
         "Set whether to print the current matcher,\n"
+        "  set traversal <kind>              "
+        "Set traversal kind of clang-query session. Available kinds are:\n"
+        "    AsIs                            "
+        "Print and match the AST as clang sees it.  This mode is the "
+        "default.\n"
+        "    IgnoreImplicitCastsAndParentheses  "
+        "Omit implicit casts and parens in matching and dumping.\n"
+        "    IgnoreUnlessSpelledInSource     "
+        "Omit AST nodes unless spelled in the source.\n"
         "  set output <feature>              "
         "Set whether to output only <feature> content.\n"
         "  enable output <feature>           "
@@ -98,12 +107,29 @@ bool MatchQuery::run(llvm::raw_ostream &OS, QuerySession &QS) const {
       OS << "Not a valid top-level matcher.\n";
       return false;
     }
+
+    AST->getASTContext().getParentMapContext().setTraversalKind(QS.TK);
     Finder.matchAST(AST->getASTContext());
 
     if (QS.PrintMatcher) {
-      std::string prefixText = "Matcher: ";
-      OS << "\n  " << prefixText << Source << "\n";
-      OS << "  " << std::string(prefixText.size() + Source.size(), '=') << '\n';
+      SmallVector<StringRef, 4> Lines;
+      Source.split(Lines, "\n");
+      auto FirstLine = Lines[0];
+      Lines.erase(Lines.begin(), Lines.begin() + 1);
+      while (!Lines.empty() && Lines.back().empty()) {
+        Lines.resize(Lines.size() - 1);
+      }
+      unsigned MaxLength = FirstLine.size();
+      std::string PrefixText = "Matcher: ";
+      OS << "\n  " << PrefixText << FirstLine;
+
+      for (auto Line : Lines) {
+        OS << "\n" << std::string(PrefixText.size() + 2, ' ') << Line;
+        MaxLength = std::max<int>(MaxLength, Line.rtrim().size());
+      }
+
+      OS << "\n"
+         << "  " << std::string(PrefixText.size() + MaxLength, '=') << "\n\n";
     }
 
     for (auto MI = Matches.begin(), ME = Matches.end(); MI != ME; ++MI) {
@@ -131,8 +157,8 @@ bool MatchQuery::run(llvm::raw_ostream &OS, QuerySession &QS) const {
           OS << "Binding for \"" << BI->first << "\":\n";
           const ASTContext &Ctx = AST->getASTContext();
           const SourceManager &SM = Ctx.getSourceManager();
-          ASTDumper Dumper(OS, &Ctx.getCommentCommandTraits(), &SM,
-                SM.getDiagnostics().getShowColors(), Ctx.getPrintingPolicy());
+          ASTDumper Dumper(OS, Ctx, SM.getDiagnostics().getShowColors());
+          Dumper.SetTraversalKind(QS.TK);
           Dumper.Visit(BI->second);
           OS << "\n";
         }

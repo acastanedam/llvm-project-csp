@@ -10,8 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "CGOpenMPRuntime.h"
 #include "CodeGenFunction.h"
 #include "CodeGenModule.h"
+#include "ConstantEmitter.h"
 #include "clang/AST/StmtVisitor.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/Constants.h"
@@ -96,11 +98,14 @@ public:
   }
 
   ComplexPairTy VisitStmt(Stmt *S) {
-    S->dump(CGF.getContext().getSourceManager());
+    S->dump(llvm::errs(), CGF.getContext());
     llvm_unreachable("Stmt can't have complex result type!");
   }
   ComplexPairTy VisitExpr(Expr *S);
   ComplexPairTy VisitConstantExpr(ConstantExpr *E) {
+    if (llvm::Constant *Result = ConstantEmitter(CGF).tryEmitConstantExpr(E))
+      return ComplexPairTy(Result->getAggregateElement(0U),
+                           Result->getAggregateElement(1U));
     return Visit(E->getSubExpr());
   }
   ComplexPairTy VisitParenExpr(ParenExpr *PE) { return Visit(PE->getSubExpr());}
@@ -221,7 +226,6 @@ public:
     return Visit(DIE->getExpr());
   }
   ComplexPairTy VisitExprWithCleanups(ExprWithCleanups *E) {
-    CGF.enterFullExpression(E);
     CodeGenFunction::RunCleanupsScope Scope(CGF);
     ComplexPairTy Vals = Visit(E->getSubExpr());
     // Defend against dominance problems caused by jumps out of expression
@@ -430,8 +434,10 @@ ComplexPairTy ComplexExprEmitter::EmitComplexToComplexCast(ComplexPairTy Val,
   // C99 6.3.1.6: When a value of complex type is converted to another
   // complex type, both the real and imaginary parts follow the conversion
   // rules for the corresponding real types.
-  Val.first = CGF.EmitScalarConversion(Val.first, SrcType, DestType, Loc);
-  Val.second = CGF.EmitScalarConversion(Val.second, SrcType, DestType, Loc);
+  if (Val.first)
+    Val.first = CGF.EmitScalarConversion(Val.first, SrcType, DestType, Loc);
+  if (Val.second)
+    Val.second = CGF.EmitScalarConversion(Val.second, SrcType, DestType, Loc);
   return Val;
 }
 
@@ -521,6 +527,8 @@ ComplexPairTy ComplexExprEmitter::EmitCast(CastKind CK, Expr *Op,
   case CK_ZeroToOCLOpaqueType:
   case CK_AddressSpaceConversion:
   case CK_IntToOCLSampler:
+  case CK_FloatingToFixedPoint:
+  case CK_FixedPointToFloating:
   case CK_FixedPointCast:
   case CK_FixedPointToBoolean:
   case CK_FixedPointToIntegral:
@@ -528,16 +536,20 @@ ComplexPairTy ComplexExprEmitter::EmitCast(CastKind CK, Expr *Op,
     llvm_unreachable("invalid cast kind for complex value");
 
   case CK_FloatingRealToComplex:
-  case CK_IntegralRealToComplex:
+  case CK_IntegralRealToComplex: {
+    CodeGenFunction::CGFPOptionsRAII FPOptsRAII(CGF, Op);
     return EmitScalarToComplexCast(CGF.EmitScalarExpr(Op), Op->getType(),
                                    DestTy, Op->getExprLoc());
+  }
 
   case CK_FloatingComplexCast:
   case CK_FloatingComplexToIntegralComplex:
   case CK_IntegralComplexCast:
-  case CK_IntegralComplexToFloatingComplex:
+  case CK_IntegralComplexToFloatingComplex: {
+    CodeGenFunction::CGFPOptionsRAII FPOptsRAII(CGF, Op);
     return EmitComplexToComplexCast(Visit(Op), Op->getType(), DestTy,
                                     Op->getExprLoc());
+  }
   }
 
   llvm_unreachable("unknown cast resulting in complex value");
@@ -892,6 +904,7 @@ EmitCompoundAssignLValue(const CompoundAssignOperator *E,
   if (const AtomicType *AT = LHSTy->getAs<AtomicType>())
     LHSTy = AT->getValueType();
 
+  CodeGenFunction::CGFPOptionsRAII FPOptsRAII(CGF, E);
   BinOpInfo OpInfo;
 
   // Load the RHS and LHS operands.
@@ -1136,7 +1149,11 @@ ComplexPairTy CodeGenFunction::EmitLoadOfComplex(LValue src,
 LValue CodeGenFunction::EmitComplexAssignmentLValue(const BinaryOperator *E) {
   assert(E->getOpcode() == BO_Assign);
   ComplexPairTy Val; // ignored
-  return ComplexExprEmitter(*this).EmitBinAssignLValue(E, Val);
+  LValue LVal = ComplexExprEmitter(*this).EmitBinAssignLValue(E, Val);
+  if (getLangOpts().OpenMP)
+    CGM.getOpenMPRuntime().checkAndEmitLastprivateConditional(*this,
+                                                              E->getLHS());
+  return LVal;
 }
 
 typedef ComplexPairTy (ComplexExprEmitter::*CompoundFunc)(

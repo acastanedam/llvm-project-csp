@@ -1,7 +1,6 @@
 /*
  * task-taskgroup-unrelated.c -- Archer testcase
  */
-
 //===----------------------------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -12,11 +11,12 @@
 //===----------------------------------------------------------------------===//
 
 // RUN: %libarcher-compile-and-run-race | FileCheck %s
+// RUN: %libarcher-compile-and-run-race-noserial | FileCheck %s
 // REQUIRES: tsan
+#include "ompt/ompt-signal.h"
 #include <omp.h>
 #include <stdio.h>
 #include <unistd.h>
-#include "ompt/ompt-signal.h"
 
 int main(int argc, char *argv[]) {
   int var = 0, a = 0;
@@ -54,9 +54,8 @@ int main(int argc, char *argv[]) {
 
 // CHECK: WARNING: ThreadSanitizer: data race
 // CHECK-NEXT:   {{(Write|Read)}} of size 4
-// CHECK-NEXT: #0 {{.*}}task-taskgroup-unrelated.c:46
+// CHECK-NEXT: #0 {{.*}}task-taskgroup-unrelated.c:47
 // CHECK:   Previous write of size 4
-// CHECK-NEXT: #0 {{.*}}task-taskgroup-unrelated.c:28
+// CHECK-NEXT: #0 {{.*}}task-taskgroup-unrelated.c:29
 // CHECK: DONE
 // CHECK: ThreadSanitizer: reported 1 warnings
-

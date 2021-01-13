@@ -5,12 +5,14 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-#include "Logger.h"
 #include "Protocol.h" // For LSPError
-#include "Shutdown.h"
 #include "Transport.h"
+#include "support/Cancellation.h"
+#include "support/Logger.h"
+#include "support/Shutdown.h"
 #include "llvm/Support/Errno.h"
 #include "llvm/Support/Error.h"
+#include <system_error>
 
 namespace clang {
 namespace clangd {
@@ -19,8 +21,24 @@ namespace {
 llvm::json::Object encodeError(llvm::Error E) {
   std::string Message;
   ErrorCode Code = ErrorCode::UnknownErrorCode;
+  // FIXME: encode cancellation errors using RequestCancelled or ContentModified
+  // as appropriate.
   if (llvm::Error Unhandled = llvm::handleErrors(
-          std::move(E), [&](const LSPError &L) -> llvm::Error {
+          std::move(E),
+          [&](const CancelledError &C) -> llvm::Error {
+            switch (C.Reason) {
+            case static_cast<int>(ErrorCode::ContentModified):
+              Code = ErrorCode::ContentModified;
+              Message = "Request cancelled because the document was modified";
+              break;
+            default:
+              Code = ErrorCode::RequestCancelled;
+              Message = "Request cancelled";
+              break;
+            }
+            return llvm::Error::success();
+          },
+          [&](const LSPError &L) -> llvm::Error {
             Message = L.Message;
             Code = L.Code;
             return llvm::Error::success();
@@ -34,11 +52,10 @@ llvm::json::Object encodeError(llvm::Error E) {
 }
 
 llvm::Error decodeError(const llvm::json::Object &O) {
-  std::string Msg = O.getString("message").getValueOr("Unspecified error");
+  llvm::StringRef Msg = O.getString("message").getValueOr("Unspecified error");
   if (auto Code = O.getInteger("code"))
-    return llvm::make_error<LSPError>(std::move(Msg), ErrorCode(*Code));
-  return llvm::make_error<llvm::StringError>(std::move(Msg),
-                                             llvm::inconvertibleErrorCode());
+    return llvm::make_error<LSPError>(Msg.str(), ErrorCode(*Code));
+  return error(Msg.str());
 }
 
 class JSONTransport : public Transport {
@@ -84,9 +101,8 @@ public:
   llvm::Error loop(MessageHandler &Handler) override {
     while (!feof(In)) {
       if (shutdownRequested())
-        return llvm::createStringError(
-            std::make_error_code(std::errc::operation_canceled),
-            "Got signal, shutting down");
+        return error(std::make_error_code(std::errc::operation_canceled),
+                     "Got signal, shutting down");
       if (ferror(In))
         return llvm::errorCodeToError(
             std::error_code(errno, std::system_category()));
@@ -110,13 +126,13 @@ private:
   bool handleMessage(llvm::json::Value Message, MessageHandler &Handler);
   // Writes outgoing message to Out stream.
   void sendMessage(llvm::json::Value Message) {
-    std::string S;
-    llvm::raw_string_ostream OS(S);
+    OutputBuffer.clear();
+    llvm::raw_svector_ostream OS(OutputBuffer);
     OS << llvm::formatv(Pretty ? "{0:2}" : "{0}", Message);
-    OS.flush();
-    Out << "Content-Length: " << S.size() << "\r\n\r\n" << S;
+    Out << "Content-Length: " << OutputBuffer.size() << "\r\n\r\n"
+        << OutputBuffer;
     Out.flush();
-    vlog(">>> {0}\n", S);
+    vlog(">>> {0}\n", OutputBuffer);
   }
 
   // Read raw string messages from input stream.
@@ -127,6 +143,7 @@ private:
   llvm::Optional<std::string> readDelimitedMessage();
   llvm::Optional<std::string> readStandardMessage();
 
+  llvm::SmallVector<char, 0> OutputBuffer;
   std::FILE *In;
   llvm::raw_ostream &Out;
   llvm::raw_ostream &InMirror;

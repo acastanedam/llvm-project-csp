@@ -20,8 +20,9 @@ static auto RWFlags =
 
 TEST(LinkGraphTest, Construction) {
   // Check that LinkGraph construction works as expected.
-  LinkGraph G("foo", 8, support::little);
+  LinkGraph G("foo", Triple("x86_64-apple-darwin"), 8, support::little);
   EXPECT_EQ(G.getName(), "foo");
+  EXPECT_EQ(G.getTargetTriple().str(), "x86_64-apple-darwin");
   EXPECT_EQ(G.getPointerSize(), 8U);
   EXPECT_EQ(G.getEndianness(), support::little);
   EXPECT_TRUE(llvm::empty(G.external_symbols()));
@@ -38,7 +39,7 @@ TEST(LinkGraphTest, BlockAndSymbolIteration) {
                                     0x1C, 0x1D, 0x1E, 0x1F, 0x00};
   StringRef BlockContent(BlockContentBytes);
 
-  LinkGraph G("foo", 8, support::little);
+  LinkGraph G("foo", Triple("x86_64-apple-darwin"), 8, support::little);
   auto &Sec1 = G.createSection("__data.1", RWFlags);
   auto &B1 = G.createContentBlock(Sec1, BlockContent, 0x1000, 8, 0);
   auto &B2 = G.createContentBlock(Sec1, BlockContent, 0x2000, 8, 0);
@@ -56,17 +57,17 @@ TEST(LinkGraphTest, BlockAndSymbolIteration) {
                                 false, false);
 
   // Check that iteration of blocks within a section behaves as expected.
-  EXPECT_EQ(std::distance(Sec1.blocks().begin(), Sec1.blocks().end()), 2U);
+  EXPECT_EQ(std::distance(Sec1.blocks().begin(), Sec1.blocks().end()), 2);
   EXPECT_TRUE(llvm::count(Sec1.blocks(), &B1));
   EXPECT_TRUE(llvm::count(Sec1.blocks(), &B2));
 
   // Check that iteration of symbols within a section behaves as expected.
-  EXPECT_EQ(std::distance(Sec1.symbols().begin(), Sec1.symbols().end()), 2U);
+  EXPECT_EQ(std::distance(Sec1.symbols().begin(), Sec1.symbols().end()), 2);
   EXPECT_TRUE(llvm::count(Sec1.symbols(), &S1));
   EXPECT_TRUE(llvm::count(Sec1.symbols(), &S2));
 
   // Check that iteration of blocks across sections behaves as expected.
-  EXPECT_EQ(std::distance(G.blocks().begin(), G.blocks().end()), 4U);
+  EXPECT_EQ(std::distance(G.blocks().begin(), G.blocks().end()), 4);
   EXPECT_TRUE(llvm::count(G.blocks(), &B1));
   EXPECT_TRUE(llvm::count(G.blocks(), &B2));
   EXPECT_TRUE(llvm::count(G.blocks(), &B3));
@@ -75,8 +76,7 @@ TEST(LinkGraphTest, BlockAndSymbolIteration) {
   // Check that iteration of defined symbols across sections behaves as
   // expected.
   EXPECT_EQ(
-      std::distance(G.defined_symbols().begin(), G.defined_symbols().end()),
-      4U);
+      std::distance(G.defined_symbols().begin(), G.defined_symbols().end()), 4);
   EXPECT_TRUE(llvm::count(G.defined_symbols(), &S1));
   EXPECT_TRUE(llvm::count(G.defined_symbols(), &S2));
   EXPECT_TRUE(llvm::count(G.defined_symbols(), &S3));
@@ -91,7 +91,7 @@ TEST(LinkGraphTest, SplitBlock) {
                                     0x1C, 0x1D, 0x1E, 0x1F, 0x00};
   StringRef BlockContent(BlockContentBytes);
 
-  LinkGraph G("foo", 8, support::little);
+  LinkGraph G("foo", Triple("x86_64-apple-darwin"), 8, support::little);
   auto &Sec = G.createSection("__data", RWFlags);
 
   // Create the block to split.

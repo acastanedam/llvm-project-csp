@@ -1,5 +1,7 @@
 set(LLVM_LINK_COMPONENTS
-  support
+  FrontendOpenMP
+  Support
+  TestingSupport
   )
 
 get_filename_component(CLANG_LINT_SOURCE_DIR
@@ -7,6 +9,7 @@ get_filename_component(CLANG_LINT_SOURCE_DIR
 include_directories(${CLANG_LINT_SOURCE_DIR})
 
 add_extra_unittest(ClangTidyTests
+  AddConstTest.cpp
   ClangTidyDiagnosticConsumerTest.cpp
   ClangTidyOptionsTest.cpp
   IncludeInserterTest.cpp
@@ -15,6 +18,7 @@ add_extra_unittest(ClangTidyTests
   LLVMModuleTest.cpp
   NamespaceAliaserTest.cpp
   ObjCModuleTest.cpp
+  OptionsProviderTest.cpp
   OverlappingReplacementsTest.cpp
   UsingInserterTest.cpp
   ReadabilityModuleTest.cpp

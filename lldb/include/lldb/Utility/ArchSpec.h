@@ -16,6 +16,7 @@
 #include "lldb/lldb-private-enumerations.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Triple.h"
+#include "llvm/Support/YAMLTraits.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -89,6 +90,12 @@ public:
   enum ARMeflags {
     eARM_abi_soft_float = 0x00000200,
     eARM_abi_hard_float = 0x00000400
+  };
+
+  enum RISCVSubType {
+    eRISCVSubType_unknown,
+    eRISCVSubType_riscv32,
+    eRISCVSubType_riscv64,
   };
 
   enum Core {
@@ -183,10 +190,17 @@ public:
     eCore_hexagon_hexagonv4,
     eCore_hexagon_hexagonv5,
 
+    eCore_riscv32,
+    eCore_riscv64,
+
     eCore_uknownMach32,
     eCore_uknownMach64,
 
     eCore_arc, // little endian ARC
+
+    eCore_avr,
+
+    eCore_wasm32,
 
     kNumCores,
 
@@ -500,7 +514,7 @@ public:
 
   void SetFlags(uint32_t flags) { m_flags = flags; }
 
-  void SetFlags(std::string elf_abi);
+  void SetFlags(const std::string &elf_abi);
 
 protected:
   bool IsEqualTo(const ArchSpec &rhs, bool exact_match) const;
@@ -537,4 +551,16 @@ bool ParseMachCPUDashSubtypeTriple(llvm::StringRef triple_str, ArchSpec &arch);
 
 } // namespace lldb_private
 
-#endif // #ifndef LLDB_UTILITY_ARCHSPEC_H
+namespace llvm {
+namespace yaml {
+template <> struct ScalarTraits<lldb_private::ArchSpec> {
+  static void output(const lldb_private::ArchSpec &, void *, raw_ostream &);
+  static StringRef input(StringRef, void *, lldb_private::ArchSpec &);
+  static QuotingType mustQuote(StringRef S) { return QuotingType::Double; }
+};
+} // namespace yaml
+} // namespace llvm
+
+LLVM_YAML_IS_SEQUENCE_VECTOR(lldb_private::ArchSpec)
+
+#endif // LLDB_UTILITY_ARCHSPEC_H

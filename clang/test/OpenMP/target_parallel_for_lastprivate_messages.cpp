@@ -5,6 +5,7 @@
 // RUN: %clang_cc1 -verify=expected,omp50 -fopenmp-version=50 -fopenmp-simd %s -Wuninitialized
 
 typedef void **omp_allocator_handle_t;
+extern const omp_allocator_handle_t omp_null_allocator;
 extern const omp_allocator_handle_t omp_default_mem_alloc;
 extern const omp_allocator_handle_t omp_large_cap_mem_alloc;
 extern const omp_allocator_handle_t omp_const_mem_alloc;
@@ -107,6 +108,9 @@ int foomain(int argc, char **argv) {
 #pragma omp target parallel for lastprivate(conditional: s,argc) lastprivate(conditional: // omp50-error {{expected expression}} omp45-error 2 {{use of undeclared identifier 'conditional'}} expected-error {{expected ')'}} expected-note {{to match this '('}} omp50-error {{expected list item of scalar type in 'lastprivate' clause with 'conditional' modifier}}
   for (int k = 0; k < argc; ++k)
     ++k;
+#pragma omp target parallel for lastprivate(foo:argc) // omp50-error {{expected 'conditional' in OpenMP clause 'lastprivate'}} omp45-error {{expected ',' or ')' in 'lastprivate' clause}} omp45-error {{expected ')'}} omp45-error {{expected variable name}} omp45-note {{to match this '('}}
+  for (int k = 0; k < argc; ++k)
+    ++k;
 #pragma omp target parallel for lastprivate(S1) // expected-error {{'S1' does not refer to a value}}
   for (int k = 0; k < argc; ++k)
     ++k;
@@ -193,7 +197,7 @@ int main(int argc, char **argv) {
 #pragma omp target parallel for lastprivate(2 * 2) // expected-error {{expected variable name}}
   for (i = 0; i < argc; ++i)
     foo();
-#pragma omp target parallel for lastprivate(ba) allocate(omp_thread_mem_alloc: ba) // expected-warning {{allocator with the 'thread' trait access has unspecified behavior on 'target parallel for' directive}}
+#pragma omp target parallel for lastprivate(ba) allocate(omp_thread_mem_alloc: ba) uses_allocators(omp_thread_mem_alloc) // expected-warning {{allocator with the 'thread' trait access has unspecified behavior on 'target parallel for' directive}} omp45-error {{unexpected OpenMP clause 'uses_allocators' in directive '#pragma omp target parallel for'}}
   for (i = 0; i < argc; ++i)
     foo();
 #pragma omp target parallel for lastprivate(ca) // expected-error {{const-qualified variable without mutable fields cannot be lastprivate}}

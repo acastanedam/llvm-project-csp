@@ -14,34 +14,8 @@
 
 #include "AMDGPU.h"
 #include "AMDGPUSubtarget.h"
-#include "R600Defines.h"
-#include "R600InstrInfo.h"
 #include "R600MachineFunctionInfo.h"
-#include "R600RegisterInfo.h"
-#include "MCTargetDesc/AMDGPUMCTargetDesc.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringRef.h"
-#include "llvm/CodeGen/MachineBasicBlock.h"
-#include "llvm/CodeGen/MachineFunction.h"
-#include "llvm/CodeGen/MachineFunctionPass.h"
-#include "llvm/CodeGen/MachineInstr.h"
-#include "llvm/CodeGen/MachineInstrBuilder.h"
-#include "llvm/CodeGen/MachineOperand.h"
-#include "llvm/IR/CallingConv.h"
-#include "llvm/IR/DebugLoc.h"
-#include "llvm/IR/Function.h"
-#include "llvm/Pass.h"
-#include "llvm/Support/Compiler.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/MathExtras.h"
-#include "llvm/Support/raw_ostream.h"
-#include <algorithm>
-#include <cassert>
-#include <cstdint>
 #include <set>
-#include <utility>
-#include <vector>
 
 using namespace llvm;
 
@@ -159,8 +133,7 @@ unsigned CFStack::getSubEntrySize(CFStack::StackItem Item) {
 }
 
 void CFStack::updateMaxStackSize() {
-  unsigned CurrentStackSize =
-      CurrentEntries + (alignTo(CurrentSubEntries, 4) / 4);
+  unsigned CurrentStackSize = CurrentEntries + divideCeil(CurrentSubEntries, 4);
   MaxStackSize = std::max(CurrentStackSize, MaxStackSize);
 }
 
@@ -308,7 +281,7 @@ private:
           DstMI = Reg;
         else
           DstMI = TRI->getMatchingSuperReg(Reg,
-              AMDGPURegisterInfo::getSubRegFromChannel(TRI->getHWRegChan(Reg)),
+              R600RegisterInfo::getSubRegFromChannel(TRI->getHWRegChan(Reg)),
               &R600::R600_Reg128RegClass);
       }
       if (MO.isUse()) {
@@ -317,7 +290,7 @@ private:
           SrcMI = Reg;
         else
           SrcMI = TRI->getMatchingSuperReg(Reg,
-              AMDGPURegisterInfo::getSubRegFromChannel(TRI->getHWRegChan(Reg)),
+              R600RegisterInfo::getSubRegFromChannel(TRI->getHWRegChan(Reg)),
               &R600::R600_Reg128RegClass);
       }
     }

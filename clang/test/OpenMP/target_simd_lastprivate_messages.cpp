@@ -4,7 +4,9 @@
 // RUN: %clang_cc1 -verify=expected,omp45 -fopenmp-version=45 -fopenmp-simd %s -Wuninitialized
 // RUN: %clang_cc1 -verify=expected,omp50 -fopenmp-version=50 -fopenmp-simd %s -Wuninitialized
 
+#pragma omp requires dynamic_allocators
 typedef void **omp_allocator_handle_t;
+extern const omp_allocator_handle_t omp_null_allocator;
 extern const omp_allocator_handle_t omp_default_mem_alloc;
 extern const omp_allocator_handle_t omp_large_cap_mem_alloc;
 extern const omp_allocator_handle_t omp_const_mem_alloc;
@@ -105,6 +107,9 @@ int foomain(int argc, char **argv) {
   for (int k = 0; k < argc; ++k)
     ++k;
 #pragma omp target simd lastprivate(conditional: s,argc) lastprivate(conditional: // omp45-error 2 {{use of undeclared identifier 'conditional'}} omp50-error {{expected expression}} expected-error {{expected ')'}} expected-note {{to match this '('}} omp50-error {{expected list item of scalar type in 'lastprivate' clause with 'conditional' modifier}}
+  for (int k = 0; k < argc; ++k)
+    ++k;
+#pragma omp target simd lastprivate(foo:argc) // omp50-error {{expected 'conditional' in OpenMP clause 'lastprivate'}} omp45-error {{expected ',' or ')' in 'lastprivate' clause}} omp45-error {{expected ')'}} omp45-error {{expected variable name}} omp45-note {{to match this '('}}
   for (int k = 0; k < argc; ++k)
     ++k;
 #pragma omp target simd lastprivate(S1) // expected-error {{'S1' does not refer to a value}}

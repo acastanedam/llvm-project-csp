@@ -49,27 +49,28 @@ Sema::PragmaStackSentinelRAII::~PragmaStackSentinelRAII() {
 
 void Sema::AddAlignmentAttributesForRecord(RecordDecl *RD) {
   // If there is no pack value, we don't need any attributes.
-  if (!PackStack.CurrentValue)
+  if (!AlignPackStack.CurrentValue)
     return;
 
   // Otherwise, check to see if we need a max field alignment attribute.
-  if (unsigned Alignment = PackStack.CurrentValue) {
+  if (unsigned Alignment = AlignPackStack.CurrentValue) {
     if (Alignment == Sema::kMac68kAlignmentSentinel)
       RD->addAttr(AlignMac68kAttr::CreateImplicit(Context));
     else
       RD->addAttr(MaxFieldAlignmentAttr::CreateImplicit(Context,
                                                         Alignment * 8));
   }
-  if (PackIncludeStack.empty())
+  if (AlignPackIncludeStack.empty())
     return;
-  // The #pragma pack affected a record in an included file,  so Clang should
-  // warn when that pragma was written in a file that included the included
-  // file.
-  for (auto &PackedInclude : llvm::reverse(PackIncludeStack)) {
-    if (PackedInclude.CurrentPragmaLocation != PackStack.CurrentPragmaLocation)
+  // The #pragma align/pack affected a record in an included file, so Clang
+  // should warn when that the pragma was written in a file that included the
+  // included file.
+  for (auto &AlignPackedInclude : llvm::reverse(AlignPackIncludeStack)) {
+    if (AlignPackedInclude.CurrentPragmaLocation !=
+        AlignPackStack.CurrentPragmaLocation)
       break;
-    if (PackedInclude.HasNonDefaultValue)
-      PackedInclude.ShouldWarnOnInclude = true;
+    if (AlignPackedInclude.HasNonDefaultValue)
+      AlignPackedInclude.ShouldWarnOnInclude = true;
   }
 }
 
@@ -238,8 +239,8 @@ void Sema::ActOnPragmaOptionsAlign(PragmaOptionsAlignKind Kind,
     // Reset just pops the top of the stack, or resets the current alignment to
     // default.
     Action = Sema::PSK_Pop;
-    if (PackStack.Stack.empty()) {
-      if (PackStack.CurrentValue) {
+    if (AlignPackStack.Stack.empty()) {
+      if (AlignPackStack.CurrentValue) {
         Action = Sema::PSK_Reset;
       } else {
         Diag(PragmaLoc, diag::warn_pragma_options_align_reset_failed)
@@ -250,18 +251,21 @@ void Sema::ActOnPragmaOptionsAlign(PragmaOptionsAlignKind Kind,
     break;
   }
 
-  PackStack.Act(PragmaLoc, Action, StringRef(), Alignment);
+  AlignPackStack.Act(PragmaLoc, Action, StringRef(), Alignment);
 }
 
 void Sema::ActOnPragmaClangSection(SourceLocation PragmaLoc, PragmaClangSectionAction Action,
                                    PragmaClangSectionKind SecKind, StringRef SecName) {
   PragmaClangSection *CSec;
+  int SectionFlags = ASTContext::PSF_Read;
   switch (SecKind) {
     case PragmaClangSectionKind::PCSK_BSS:
       CSec = &PragmaClangBSSSection;
+      SectionFlags |= ASTContext::PSF_Write | ASTContext::PSF_ZeroInit;
       break;
     case PragmaClangSectionKind::PCSK_Data:
       CSec = &PragmaClangDataSection;
+      SectionFlags |= ASTContext::PSF_Write;
       break;
     case PragmaClangSectionKind::PCSK_Rodata:
       CSec = &PragmaClangRodataSection;
@@ -271,6 +275,7 @@ void Sema::ActOnPragmaClangSection(SourceLocation PragmaLoc, PragmaClangSectionA
       break;
     case PragmaClangSectionKind::PCSK_Text:
       CSec = &PragmaClangTextSection;
+      SectionFlags |= ASTContext::PSF_Execute;
       break;
     default:
       llvm_unreachable("invalid clang section kind");
@@ -281,8 +286,11 @@ void Sema::ActOnPragmaClangSection(SourceLocation PragmaLoc, PragmaClangSectionA
     return;
   }
 
+  if (UnifySection(SecName, SectionFlags, PragmaLoc))
+    return;
+
   CSec->Valid = true;
-  CSec->SectionName = SecName;
+  CSec->SectionName = std::string(SecName);
   CSec->PragmaLocation = PragmaLoc;
 }
 
@@ -293,26 +301,24 @@ void Sema::ActOnPragmaPack(SourceLocation PragmaLoc, PragmaMsStackAction Action,
   // If specified then alignment must be a "small" power of two.
   unsigned AlignmentVal = 0;
   if (Alignment) {
-    llvm::APSInt Val;
+    Optional<llvm::APSInt> Val;
 
     // pack(0) is like pack(), which just works out since that is what
     // we use 0 for in PackAttr.
-    if (Alignment->isTypeDependent() ||
-        Alignment->isValueDependent() ||
-        !Alignment->isIntegerConstantExpr(Val, Context) ||
-        !(Val == 0 || Val.isPowerOf2()) ||
-        Val.getZExtValue() > 16) {
+    if (Alignment->isTypeDependent() || Alignment->isValueDependent() ||
+        !(Val = Alignment->getIntegerConstantExpr(Context)) ||
+        !(*Val == 0 || Val->isPowerOf2()) || Val->getZExtValue() > 16) {
       Diag(PragmaLoc, diag::warn_pragma_pack_invalid_alignment);
       return; // Ignore
     }
 
-    AlignmentVal = (unsigned) Val.getZExtValue();
+    AlignmentVal = (unsigned)Val->getZExtValue();
   }
   if (Action == Sema::PSK_Show) {
     // Show the current alignment, making sure to show the right value
     // for the default.
     // FIXME: This should come from the target.
-    AlignmentVal = PackStack.CurrentValue;
+    AlignmentVal = AlignPackStack.CurrentValue;
     if (AlignmentVal == 0)
       AlignmentVal = 8;
     if (AlignmentVal == Sema::kMac68kAlignmentSentinel)
@@ -325,61 +331,72 @@ void Sema::ActOnPragmaPack(SourceLocation PragmaLoc, PragmaMsStackAction Action,
   if (Action & Sema::PSK_Pop) {
     if (Alignment && !SlotLabel.empty())
       Diag(PragmaLoc, diag::warn_pragma_pack_pop_identifier_and_alignment);
-    if (PackStack.Stack.empty())
+    if (AlignPackStack.Stack.empty())
       Diag(PragmaLoc, diag::warn_pragma_pop_failed) << "pack" << "stack empty";
   }
 
-  PackStack.Act(PragmaLoc, Action, SlotLabel, AlignmentVal);
+  AlignPackStack.Act(PragmaLoc, Action, SlotLabel, AlignmentVal);
 }
 
-void Sema::DiagnoseNonDefaultPragmaPack(PragmaPackDiagnoseKind Kind,
-                                        SourceLocation IncludeLoc) {
-  if (Kind == PragmaPackDiagnoseKind::NonDefaultStateAtInclude) {
-    SourceLocation PrevLocation = PackStack.CurrentPragmaLocation;
+void Sema::DiagnoseNonDefaultPragmaAlignPack(PragmaAlignPackDiagnoseKind Kind,
+                                             SourceLocation IncludeLoc) {
+  if (Kind == PragmaAlignPackDiagnoseKind::NonDefaultStateAtInclude) {
+    SourceLocation PrevLocation = AlignPackStack.CurrentPragmaLocation;
     // Warn about non-default alignment at #includes (without redundant
     // warnings for the same directive in nested includes).
     // The warning is delayed until the end of the file to avoid warnings
     // for files that don't have any records that are affected by the modified
     // alignment.
     bool HasNonDefaultValue =
-        PackStack.hasValue() &&
-        (PackIncludeStack.empty() ||
-         PackIncludeStack.back().CurrentPragmaLocation != PrevLocation);
-    PackIncludeStack.push_back(
-        {PackStack.CurrentValue,
-         PackStack.hasValue() ? PrevLocation : SourceLocation(),
+        AlignPackStack.hasValue() &&
+        (AlignPackIncludeStack.empty() ||
+         AlignPackIncludeStack.back().CurrentPragmaLocation != PrevLocation);
+    AlignPackIncludeStack.push_back(
+        {AlignPackStack.CurrentValue,
+         AlignPackStack.hasValue() ? PrevLocation : SourceLocation(),
          HasNonDefaultValue, /*ShouldWarnOnInclude*/ false});
     return;
   }
 
-  assert(Kind == PragmaPackDiagnoseKind::ChangedStateAtExit && "invalid kind");
-  PackIncludeState PrevPackState = PackIncludeStack.pop_back_val();
-  if (PrevPackState.ShouldWarnOnInclude) {
+  assert(Kind == PragmaAlignPackDiagnoseKind::ChangedStateAtExit &&
+         "invalid kind");
+  AlignPackIncludeState PrevAlignPackState =
+      AlignPackIncludeStack.pop_back_val();
+  // FIXME: AlignPackStack may contain both #pragma align and #pragma pack
+  // information, diagnostics below might not be accurate if we have mixed
+  // pragmas.
+  if (PrevAlignPackState.ShouldWarnOnInclude) {
     // Emit the delayed non-default alignment at #include warning.
     Diag(IncludeLoc, diag::warn_pragma_pack_non_default_at_include);
-    Diag(PrevPackState.CurrentPragmaLocation, diag::note_pragma_pack_here);
+    Diag(PrevAlignPackState.CurrentPragmaLocation, diag::note_pragma_pack_here);
   }
   // Warn about modified alignment after #includes.
-  if (PrevPackState.CurrentValue != PackStack.CurrentValue) {
+  if (PrevAlignPackState.CurrentValue != AlignPackStack.CurrentValue) {
     Diag(IncludeLoc, diag::warn_pragma_pack_modified_after_include);
-    Diag(PackStack.CurrentPragmaLocation, diag::note_pragma_pack_here);
+    Diag(AlignPackStack.CurrentPragmaLocation, diag::note_pragma_pack_here);
   }
 }
 
-void Sema::DiagnoseUnterminatedPragmaPack() {
-  if (PackStack.Stack.empty())
+void Sema::DiagnoseUnterminatedPragmaAlignPack() {
+  if (AlignPackStack.Stack.empty())
     return;
   bool IsInnermost = true;
-  for (const auto &StackSlot : llvm::reverse(PackStack.Stack)) {
+
+  // FIXME: AlignPackStack may contain both #pragma align and #pragma pack
+  // information, diagnostics below might not be accurate if we have mixed
+  // pragmas.
+  for (const auto &StackSlot : llvm::reverse(AlignPackStack.Stack)) {
     Diag(StackSlot.PragmaPushLocation, diag::warn_pragma_pack_no_pop_eof);
     // The user might have already reset the alignment, so suggest replacing
     // the reset with a pop.
-    if (IsInnermost && PackStack.CurrentValue == PackStack.DefaultValue) {
-      DiagnosticBuilder DB = Diag(PackStack.CurrentPragmaLocation,
-                                  diag::note_pragma_pack_pop_instead_reset);
-      SourceLocation FixItLoc = Lexer::findLocationAfterToken(
-          PackStack.CurrentPragmaLocation, tok::l_paren, SourceMgr, LangOpts,
-          /*SkipTrailing=*/false);
+    if (IsInnermost &&
+        AlignPackStack.CurrentValue == AlignPackStack.DefaultValue) {
+      auto DB = Diag(AlignPackStack.CurrentPragmaLocation,
+                     diag::note_pragma_pack_pop_instead_reset);
+      SourceLocation FixItLoc =
+          Lexer::findLocationAfterToken(AlignPackStack.CurrentPragmaLocation,
+                                        tok::l_paren, SourceMgr, LangOpts,
+                                        /*SkipTrailing=*/false);
       if (FixItLoc.isValid())
         DB << FixItHint::CreateInsertion(FixItLoc, "pop");
     }
@@ -407,6 +424,59 @@ void Sema::ActOnPragmaDetectMismatch(SourceLocation Loc, StringRef Name,
   Consumer.HandleTopLevelDecl(DeclGroupRef(PDMD));
 }
 
+void Sema::ActOnPragmaFloatControl(SourceLocation Loc,
+                                   PragmaMsStackAction Action,
+                                   PragmaFloatControlKind Value) {
+  FPOptionsOverride NewFPFeatures = CurFPFeatureOverrides();
+  if ((Action == PSK_Push_Set || Action == PSK_Push || Action == PSK_Pop) &&
+      !(CurContext->isTranslationUnit()) && !CurContext->isNamespace()) {
+    // Push and pop can only occur at file or namespace scope.
+    Diag(Loc, diag::err_pragma_fc_pp_scope);
+    return;
+  }
+  switch (Value) {
+  default:
+    llvm_unreachable("invalid pragma float_control kind");
+  case PFC_Precise:
+    NewFPFeatures.setFPPreciseEnabled(true);
+    FpPragmaStack.Act(Loc, Action, StringRef(), NewFPFeatures);
+    break;
+  case PFC_NoPrecise:
+    if (CurFPFeatures.getFPExceptionMode() == LangOptions::FPE_Strict)
+      Diag(Loc, diag::err_pragma_fc_noprecise_requires_noexcept);
+    else if (CurFPFeatures.getAllowFEnvAccess())
+      Diag(Loc, diag::err_pragma_fc_noprecise_requires_nofenv);
+    else
+      NewFPFeatures.setFPPreciseEnabled(false);
+    FpPragmaStack.Act(Loc, Action, StringRef(), NewFPFeatures);
+    break;
+  case PFC_Except:
+    if (!isPreciseFPEnabled())
+      Diag(Loc, diag::err_pragma_fc_except_requires_precise);
+    else
+      NewFPFeatures.setFPExceptionModeOverride(LangOptions::FPE_Strict);
+    FpPragmaStack.Act(Loc, Action, StringRef(), NewFPFeatures);
+    break;
+  case PFC_NoExcept:
+    NewFPFeatures.setFPExceptionModeOverride(LangOptions::FPE_Ignore);
+    FpPragmaStack.Act(Loc, Action, StringRef(), NewFPFeatures);
+    break;
+  case PFC_Push:
+    FpPragmaStack.Act(Loc, Sema::PSK_Push_Set, StringRef(), NewFPFeatures);
+    break;
+  case PFC_Pop:
+    if (FpPragmaStack.Stack.empty()) {
+      Diag(Loc, diag::warn_pragma_pop_failed) << "float_control"
+                                              << "stack empty";
+      return;
+    }
+    FpPragmaStack.Act(Loc, Action, StringRef(), NewFPFeatures);
+    NewFPFeatures = FpPragmaStack.CurrentValue;
+    break;
+  }
+  CurFPFeatures = NewFPFeatures.applyOverrides(getLangOpts());
+}
+
 void Sema::ActOnPragmaMSPointersToMembers(
     LangOptions::PragmaMSPointersToMembersKind RepresentationMethod,
     SourceLocation PragmaLoc) {
@@ -423,83 +493,51 @@ void Sema::ActOnPragmaMSVtorDisp(PragmaMsStackAction Action,
   VtorDispStack.Act(PragmaLoc, Action, StringRef(), Mode);
 }
 
-template<typename ValueType>
-void Sema::PragmaStack<ValueType>::Act(SourceLocation PragmaLocation,
-                                       PragmaMsStackAction Action,
-                                       llvm::StringRef StackSlotLabel,
-                                       ValueType Value) {
-  if (Action == PSK_Reset) {
-    CurrentValue = DefaultValue;
-    CurrentPragmaLocation = PragmaLocation;
-    return;
-  }
-  if (Action & PSK_Push)
-    Stack.emplace_back(StackSlotLabel, CurrentValue, CurrentPragmaLocation,
-                       PragmaLocation);
-  else if (Action & PSK_Pop) {
-    if (!StackSlotLabel.empty()) {
-      // If we've got a label, try to find it and jump there.
-      auto I = llvm::find_if(llvm::reverse(Stack), [&](const Slot &x) {
-        return x.StackSlotLabel == StackSlotLabel;
-      });
-      // If we found the label so pop from there.
-      if (I != Stack.rend()) {
-        CurrentValue = I->Value;
-        CurrentPragmaLocation = I->PragmaLocation;
-        Stack.erase(std::prev(I.base()), Stack.end());
-      }
-    } else if (!Stack.empty()) {
-      // We do not have a label, just pop the last entry.
-      CurrentValue = Stack.back().Value;
-      CurrentPragmaLocation = Stack.back().PragmaLocation;
-      Stack.pop_back();
-    }
-  }
-  if (Action & PSK_Set) {
-    CurrentValue = Value;
-    CurrentPragmaLocation = PragmaLocation;
-  }
-}
-
-bool Sema::UnifySection(StringRef SectionName,
-                        int SectionFlags,
-                        DeclaratorDecl *Decl) {
-  auto Section = Context.SectionInfos.find(SectionName);
-  if (Section == Context.SectionInfos.end()) {
+bool Sema::UnifySection(StringRef SectionName, int SectionFlags,
+                        NamedDecl *Decl) {
+  SourceLocation PragmaLocation;
+  if (auto A = Decl->getAttr<SectionAttr>())
+    if (A->isImplicit())
+      PragmaLocation = A->getLocation();
+  auto SectionIt = Context.SectionInfos.find(SectionName);
+  if (SectionIt == Context.SectionInfos.end()) {
     Context.SectionInfos[SectionName] =
-        ASTContext::SectionInfo(Decl, SourceLocation(), SectionFlags);
+        ASTContext::SectionInfo(Decl, PragmaLocation, SectionFlags);
     return false;
   }
   // A pre-declared section takes precedence w/o diagnostic.
-  if (Section->second.SectionFlags == SectionFlags ||
-      !(Section->second.SectionFlags & ASTContext::PSF_Implicit))
+  const auto &Section = SectionIt->second;
+  if (Section.SectionFlags == SectionFlags ||
+      ((SectionFlags & ASTContext::PSF_Implicit) &&
+       !(Section.SectionFlags & ASTContext::PSF_Implicit)))
     return false;
-  auto OtherDecl = Section->second.Decl;
-  Diag(Decl->getLocation(), diag::err_section_conflict)
-      << Decl << OtherDecl;
-  Diag(OtherDecl->getLocation(), diag::note_declared_at)
-      << OtherDecl->getName();
-  if (auto A = Decl->getAttr<SectionAttr>())
-    if (A->isImplicit())
-      Diag(A->getLocation(), diag::note_pragma_entered_here);
-  if (auto A = OtherDecl->getAttr<SectionAttr>())
-    if (A->isImplicit())
-      Diag(A->getLocation(), diag::note_pragma_entered_here);
+  Diag(Decl->getLocation(), diag::err_section_conflict) << Decl << Section;
+  if (Section.Decl)
+    Diag(Section.Decl->getLocation(), diag::note_declared_at)
+        << Section.Decl->getName();
+  if (PragmaLocation.isValid())
+    Diag(PragmaLocation, diag::note_pragma_entered_here);
+  if (Section.PragmaSectionLocation.isValid())
+    Diag(Section.PragmaSectionLocation, diag::note_pragma_entered_here);
   return true;
 }
 
 bool Sema::UnifySection(StringRef SectionName,
                         int SectionFlags,
                         SourceLocation PragmaSectionLocation) {
-  auto Section = Context.SectionInfos.find(SectionName);
-  if (Section != Context.SectionInfos.end()) {
-    if (Section->second.SectionFlags == SectionFlags)
+  auto SectionIt = Context.SectionInfos.find(SectionName);
+  if (SectionIt != Context.SectionInfos.end()) {
+    const auto &Section = SectionIt->second;
+    if (Section.SectionFlags == SectionFlags)
       return false;
-    if (!(Section->second.SectionFlags & ASTContext::PSF_Implicit)) {
+    if (!(Section.SectionFlags & ASTContext::PSF_Implicit)) {
       Diag(PragmaSectionLocation, diag::err_section_conflict)
-          << "this" << "a prior #pragma section";
-      Diag(Section->second.PragmaSectionLocation,
-           diag::note_pragma_entered_here);
+          << "this" << Section;
+      if (Section.Decl)
+        Diag(Section.Decl->getLocation(), diag::note_declared_at)
+            << Section.Decl->getName();
+      if (Section.PragmaSectionLocation.isValid())
+        Diag(Section.PragmaSectionLocation, diag::note_pragma_entered_here);
       return true;
     }
   }
@@ -926,31 +964,81 @@ void Sema::ActOnPragmaVisibility(const IdentifierInfo* VisType,
   }
 }
 
-void Sema::ActOnPragmaFPContract(LangOptions::FPContractModeKind FPC) {
+void Sema::ActOnPragmaFPContract(SourceLocation Loc,
+                                 LangOptions::FPModeKind FPC) {
+  FPOptionsOverride NewFPFeatures = CurFPFeatureOverrides();
   switch (FPC) {
-  case LangOptions::FPC_On:
-    FPFeatures.setAllowFPContractWithinStatement();
+  case LangOptions::FPM_On:
+    NewFPFeatures.setAllowFPContractWithinStatement();
     break;
-  case LangOptions::FPC_Fast:
-    FPFeatures.setAllowFPContractAcrossStatement();
+  case LangOptions::FPM_Fast:
+    NewFPFeatures.setAllowFPContractAcrossStatement();
     break;
-  case LangOptions::FPC_Off:
-    FPFeatures.setDisallowFPContract();
+  case LangOptions::FPM_Off:
+    NewFPFeatures.setDisallowFPContract();
     break;
+  case LangOptions::FPM_FastHonorPragmas:
+    llvm_unreachable("Should not happen");
   }
+  FpPragmaStack.Act(Loc, Sema::PSK_Set, StringRef(), NewFPFeatures);
+  CurFPFeatures = NewFPFeatures.applyOverrides(getLangOpts());
 }
 
-void Sema::ActOnPragmaFEnvAccess(LangOptions::FEnvAccessModeKind FPC) {
-  switch (FPC) {
-  case LangOptions::FEA_On:
-    FPFeatures.setAllowFEnvAccess();
-    break;
-  case LangOptions::FEA_Off:
-    FPFeatures.setDisallowFEnvAccess();
-    break;
-  }
+void Sema::ActOnPragmaFPReassociate(SourceLocation Loc, bool IsEnabled) {
+  FPOptionsOverride NewFPFeatures = CurFPFeatureOverrides();
+  NewFPFeatures.setAllowFPReassociateOverride(IsEnabled);
+  FpPragmaStack.Act(Loc, PSK_Set, StringRef(), NewFPFeatures);
+  CurFPFeatures = NewFPFeatures.applyOverrides(getLangOpts());
 }
 
+void Sema::setRoundingMode(SourceLocation Loc, llvm::RoundingMode FPR) {
+  // C2x: 7.6.2p3  If the FE_DYNAMIC mode is specified and FENV_ACCESS is "off",
+  // the translator may assume that the default rounding mode is in effect.
+  if (FPR == llvm::RoundingMode::Dynamic &&
+      !CurFPFeatures.getAllowFEnvAccess() &&
+      CurFPFeatures.getFPExceptionMode() == LangOptions::FPE_Ignore)
+    FPR = llvm::RoundingMode::NearestTiesToEven;
+
+  FPOptionsOverride NewFPFeatures = CurFPFeatureOverrides();
+  NewFPFeatures.setRoundingModeOverride(FPR);
+  FpPragmaStack.Act(Loc, PSK_Set, StringRef(), NewFPFeatures);
+  CurFPFeatures = NewFPFeatures.applyOverrides(getLangOpts());
+}
+
+void Sema::setExceptionMode(SourceLocation Loc,
+                            LangOptions::FPExceptionModeKind FPE) {
+  FPOptionsOverride NewFPFeatures = CurFPFeatureOverrides();
+  NewFPFeatures.setFPExceptionModeOverride(FPE);
+  FpPragmaStack.Act(Loc, PSK_Set, StringRef(), NewFPFeatures);
+  CurFPFeatures = NewFPFeatures.applyOverrides(getLangOpts());
+}
+
+void Sema::ActOnPragmaFEnvAccess(SourceLocation Loc, bool IsEnabled) {
+  FPOptionsOverride NewFPFeatures = CurFPFeatureOverrides();
+  auto LO = getLangOpts();
+  if (IsEnabled) {
+    // Verify Microsoft restriction:
+    // You can't enable fenv_access unless precise semantics are enabled.
+    // Precise semantics can be enabled either by the float_control
+    // pragma, or by using the /fp:precise or /fp:strict compiler options
+    if (!isPreciseFPEnabled())
+      Diag(Loc, diag::err_pragma_fenv_requires_precise);
+    NewFPFeatures.setAllowFEnvAccessOverride(true);
+    // Enabling FENV access sets the RoundingMode to Dynamic.
+    // and ExceptionBehavior to Strict
+    NewFPFeatures.setRoundingModeOverride(llvm::RoundingMode::Dynamic);
+    NewFPFeatures.setFPExceptionModeOverride(LangOptions::FPE_Strict);
+  } else {
+    NewFPFeatures.setAllowFEnvAccessOverride(false);
+  }
+  FpPragmaStack.Act(Loc, PSK_Set, StringRef(), NewFPFeatures);
+  CurFPFeatures = NewFPFeatures.applyOverrides(LO);
+}
+
+void Sema::ActOnPragmaFPExceptions(SourceLocation Loc,
+                                   LangOptions::FPExceptionModeKind FPE) {
+  setExceptionMode(Loc, FPE);
+}
 
 void Sema::PushNamespaceVisibilityAttr(const VisibilityAttr *Attr,
                                        SourceLocation Loc) {

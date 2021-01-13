@@ -5,6 +5,11 @@
 //CHECK: |-VarDecl {{.*}} foo 'const __global int'
 constexpr int foo = 0;
 
+//CHECK: |-VarDecl {{.*}} foo1 'T' cinit
+//CHECK: `-VarTemplateSpecializationDecl {{.*}} used foo1 '__global long':'__global long' cinit
+template <typename T>
+T foo1 = 0;
+
 class c {
 public:
   //CHECK: `-VarDecl {{.*}} foo2 'const __global int'
@@ -31,7 +36,7 @@ struct c2 {
 template <class T>
 struct x1 {
 //CHECK: -CXXMethodDecl {{.*}} operator= 'x1<T> &(const x1<T> &){{( __attribute__.*)?}} __generic'
-//CHECK: -CXXMethodDecl {{.*}} operator= '__generic x1<int> &(const __generic x1<int> &){{( __attribute__.*)?}} __generic'
+//CHECK: -CXXMethodDecl {{.*}} operator= '__generic x1<int> &(const __generic x1<int> &__private){{( __attribute__.*)?}} __generic'
   x1<T>& operator=(const x1<T>& xx) {
     y = xx.y;
     return *this;
@@ -42,7 +47,7 @@ struct x1 {
 template <class T>
 struct x2 {
 //CHECK: -CXXMethodDecl {{.*}} foo 'void (x1<T> *){{( __attribute__.*)?}} __generic'
-//CHECK: -CXXMethodDecl {{.*}} foo 'void (__generic x1<int> *){{( __attribute__.*)?}} __generic'
+//CHECK: -CXXMethodDecl {{.*}} foo 'void (__generic x1<int> *__private){{( __attribute__.*)?}} __generic'
   void foo(x1<T>* xx) {
     m[0] = *xx;
   }
@@ -68,7 +73,8 @@ template <class T>
 T xxx(T *in1, T in2) {
   // This pointer can't be deduced to generic because addr space
   // will be taken from the template argument.
-  //CHECK: `-VarDecl {{.*}} i 'T *' cinit
+  //CHECK: `-VarDecl {{.*}} 'T *' cinit
+  //CHECK: `-VarDecl {{.*}} i '__private int *__private' cinit
   T *i = in1;
   T ii;
   __private T *ptr = &ii;
@@ -92,23 +98,24 @@ __kernel void test() {
 }
 
 // Addr space for pointer/reference to an array
-//CHECK: FunctionDecl {{.*}} t1 'void (const float (__generic &)[2])'
+//CHECK: FunctionDecl {{.*}} t1 'void (const float (__generic &__private)[2])'
 void t1(const float (&fYZ)[2]);
-//CHECK: FunctionDecl {{.*}} t2 'void (const float (__generic *)[2])'
+//CHECK: FunctionDecl {{.*}} t2 'void (const float (__generic *__private)[2])'
 void t2(const float (*fYZ)[2]);
-//CHECK: FunctionDecl {{.*}} t3 'void (float (((__generic *)))[2])'
+//CHECK: FunctionDecl {{.*}} t3 'void (float (((__generic *__private)))[2])'
 void t3(float(((*fYZ)))[2]);
-//CHECK: FunctionDecl {{.*}} t4 'void (float (((__generic *__generic *)))[2])'
+//CHECK: FunctionDecl {{.*}} t4 'void (float (((__generic *__generic *__private)))[2])'
 void t4(float(((**fYZ)))[2]);
-//CHECK: FunctionDecl {{.*}} t5 'void (float (__generic *(__generic *))[2])'
+//CHECK: FunctionDecl {{.*}} t5 'void (float (__generic *(__generic *__private))[2])'
 void t5(float (*(*fYZ))[2]);
 
 __kernel void k() {
   __local float x[2];
-  __local float(*p)[2];
+  float(*p)[2];
   t1(x);
   t2(&x);
   t3(&x);
   t4(&p);
   t5(&p);
+  long f1 = foo1<long>;
 }

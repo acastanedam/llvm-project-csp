@@ -9,6 +9,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANGD_INDEX_SYMBOL_COLLECTOR_H
 
 #include "CanonicalIncludes.h"
+#include "CollectMacros.h"
 #include "Index.h"
 #include "SymbolOrigin.h"
 #include "clang/AST/ASTContext.h"
@@ -77,6 +78,8 @@ public:
     /// Collect symbols local to main-files, such as static functions
     /// and symbols inside an anonymous namespace.
     bool CollectMainFileSymbols = true;
+    /// Collect references to main-file symbols.
+    bool CollectMainFileRefs = false;
     /// If set to true, SymbolCollector will collect doc for all symbols.
     /// Note that documents of symbols being indexed for completion will always
     /// be collected regardless of this option.
@@ -108,6 +111,8 @@ public:
                              index::SymbolRoleSet Roles,
                              SourceLocation Loc) override;
 
+  void handleMacros(const MainFileMacros &MacroRefsToIndex);
+
   SymbolSlab takeSymbols() { return std::move(Symbols).build(); }
   RefSlab takeRefs() { return std::move(Refs).build(); }
   RelationSlab takeRelations() { return std::move(Relations).build(); }
@@ -126,7 +131,7 @@ private:
   void processRelations(const NamedDecl &ND, const SymbolID &ID,
                         ArrayRef<index::SymbolRelation> Relations);
 
-  llvm::Optional<std::string> getIncludeHeader(llvm::StringRef QName, FileID);
+  llvm::Optional<std::string> getIncludeHeader(const Symbol &S, FileID);
   bool isSelfContainedHeader(FileID);
   // Heuristically headers that only want to be included via an umbrella.
   static bool isDontIncludeMeHeader(llvm::StringRef);
@@ -151,7 +156,11 @@ private:
   std::shared_ptr<GlobalCodeCompletionAllocator> CompletionAllocator;
   std::unique_ptr<CodeCompletionTUInfo> CompletionTUInfo;
   Options Opts;
-  using SymbolRef = std::pair<SourceLocation, index::SymbolRoleSet>;
+  struct SymbolRef {
+    SourceLocation Loc;
+    index::SymbolRoleSet Roles;
+    const Decl *Container;
+  };
   // Symbols referenced from the current TU, flushed on finish().
   llvm::DenseSet<const NamedDecl *> ReferencedDecls;
   llvm::DenseSet<const IdentifierInfo *> ReferencedMacros;

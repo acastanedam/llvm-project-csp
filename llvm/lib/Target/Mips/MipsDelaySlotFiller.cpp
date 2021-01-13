@@ -96,7 +96,7 @@ static cl::opt<CompactBranchPolicy> MipsCompactBranchPolicy(
     cl::values(clEnumValN(CB_Never, "never",
                           "Do not use compact branches if possible."),
                clEnumValN(CB_Optimal, "optimal",
-                          "Use compact branches where appropiate (default)."),
+                          "Use compact branches where appropriate (default)."),
                clEnumValN(CB_Always, "always",
                           "Always use compact branches if possible.")));
 
@@ -182,7 +182,7 @@ namespace {
   /// memory instruction can be moved to a delay slot.
   class MemDefsUses : public InspectMemInstr {
   public:
-    MemDefsUses(const DataLayout &DL, const MachineFrameInfo *MFI);
+    explicit MemDefsUses(const MachineFrameInfo *MFI);
 
   private:
     using ValueType = PointerUnion<const Value *, const PseudoSourceValue *>;
@@ -200,7 +200,6 @@ namespace {
 
     const MachineFrameInfo *MFI;
     SmallPtrSet<ValueType, 4> Uses, Defs;
-    const DataLayout &DL;
 
     /// Flags indicating whether loads or stores with no underlying objects have
     /// been seen.
@@ -416,8 +415,14 @@ bool RegDefsUses::update(const MachineInstr &MI, unsigned Begin, unsigned End) {
   for (unsigned I = Begin; I != End; ++I) {
     const MachineOperand &MO = MI.getOperand(I);
 
-    if (MO.isReg() && MO.getReg())
-      HasHazard |= checkRegDefsUses(NewDefs, NewUses, MO.getReg(), MO.isDef());
+    if (MO.isReg() && MO.getReg()) {
+      if (checkRegDefsUses(NewDefs, NewUses, MO.getReg(), MO.isDef())) {
+        LLVM_DEBUG(dbgs() << DEBUG_TYPE ": found register hazard for operand "
+                          << I << ": ";
+                   MO.dump());
+        HasHazard = true;
+      }
+    }
   }
 
   Defs |= NewDefs;
@@ -486,8 +491,8 @@ bool LoadFromStackOrConst::hasHazard_(const MachineInstr &MI) {
   return true;
 }
 
-MemDefsUses::MemDefsUses(const DataLayout &DL, const MachineFrameInfo *MFI_)
-    : InspectMemInstr(false), MFI(MFI_), DL(DL) {}
+MemDefsUses::MemDefsUses(const MachineFrameInfo *MFI_)
+    : InspectMemInstr(false), MFI(MFI_) {}
 
 bool MemDefsUses::hasHazard_(const MachineInstr &MI) {
   bool HasHazard = false;
@@ -536,7 +541,7 @@ getUnderlyingObjects(const MachineInstr &MI,
 
   if (const Value *V = MMO.getValue()) {
     SmallVector<const Value *, 4> Objs;
-    GetUnderlyingObjects(V, Objs, DL);
+    ::getUnderlyingObjects(V, Objs);
 
     for (const Value *UValue : Objs) {
       if (!isIdentifiedObject(V))
@@ -698,6 +703,8 @@ bool MipsDelaySlotFiller::searchRange(MachineBasicBlock &MBB, IterTy Begin,
     if (CurrI->isBundle()) {
       LLVM_DEBUG(dbgs() << DEBUG_TYPE ": ignoring BUNDLE instruction: ";
                  CurrI->dump());
+      // However, we still need to update the register def-use information.
+      RegDU.update(*CurrI, 0, CurrI->getNumOperands());
       continue;
     }
 
@@ -767,7 +774,7 @@ bool MipsDelaySlotFiller::searchBackward(MachineBasicBlock &MBB,
 
   auto *Fn = MBB.getParent();
   RegDefsUses RegDU(*Fn->getSubtarget().getRegisterInfo());
-  MemDefsUses MemDU(Fn->getDataLayout(), &Fn->getFrameInfo());
+  MemDefsUses MemDU(&Fn->getFrameInfo());
   ReverseIter Filler;
 
   RegDU.init(Slot);
@@ -843,7 +850,7 @@ bool MipsDelaySlotFiller::searchSuccBBs(MachineBasicBlock &MBB,
     IM.reset(new LoadFromStackOrConst());
   } else {
     const MachineFrameInfo &MFI = Fn->getFrameInfo();
-    IM.reset(new MemDefsUses(Fn->getDataLayout(), &MFI));
+    IM.reset(new MemDefsUses(&MFI));
   }
 
   if (!searchRange(MBB, SuccBB->begin(), SuccBB->end(), RegDU, *IM, Slot,

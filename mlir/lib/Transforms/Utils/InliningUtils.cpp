@@ -1,6 +1,6 @@
 //===- InliningUtils.cpp ---- Misc utilities for inlining -----------------===//
 //
-// Part of the MLIR Project, under the Apache License v2.0 with LLVM Exceptions.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
@@ -14,7 +14,7 @@
 
 #include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/IR/Builders.h"
-#include "mlir/IR/Function.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Debug.h"
@@ -57,20 +57,31 @@ static void remapInlinedOperands(iterator_range<Region::iterator> inlinedBlocks,
 // InlinerInterface
 //===----------------------------------------------------------------------===//
 
+bool InlinerInterface::isLegalToInline(Operation *call, Operation *callable,
+                                       bool wouldBeCloned) const {
+  if (auto *handler = getInterfaceFor(call))
+    return handler->isLegalToInline(call, callable, wouldBeCloned);
+  return false;
+}
+
 bool InlinerInterface::isLegalToInline(
-    Region *dest, Region *src, BlockAndValueMapping &valueMapping) const {
+    Region *dest, Region *src, bool wouldBeCloned,
+    BlockAndValueMapping &valueMapping) const {
   // Regions can always be inlined into functions.
   if (isa<FuncOp>(dest->getParentOp()))
     return true;
 
-  auto *handler = getInterfaceFor(dest->getParentOp());
-  return handler ? handler->isLegalToInline(dest, src, valueMapping) : false;
+  if (auto *handler = getInterfaceFor(dest->getParentOp()))
+    return handler->isLegalToInline(dest, src, wouldBeCloned, valueMapping);
+  return false;
 }
 
 bool InlinerInterface::isLegalToInline(
-    Operation *op, Region *dest, BlockAndValueMapping &valueMapping) const {
-  auto *handler = getInterfaceFor(op);
-  return handler ? handler->isLegalToInline(op, dest, valueMapping) : false;
+    Operation *op, Region *dest, bool wouldBeCloned,
+    BlockAndValueMapping &valueMapping) const {
+  if (auto *handler = getInterfaceFor(op))
+    return handler->isLegalToInline(op, dest, wouldBeCloned, valueMapping);
+  return false;
 }
 
 bool InlinerInterface::shouldAnalyzeRecursively(Operation *op) const {
@@ -97,12 +108,13 @@ void InlinerInterface::handleTerminator(Operation *op,
 
 /// Utility to check that all of the operations within 'src' can be inlined.
 static bool isLegalToInline(InlinerInterface &interface, Region *src,
-                            Region *insertRegion,
+                            Region *insertRegion, bool shouldCloneInlinedRegion,
                             BlockAndValueMapping &valueMapping) {
   for (auto &block : *src) {
     for (auto &op : block) {
       // Check this operation.
-      if (!interface.isLegalToInline(&op, insertRegion, valueMapping)) {
+      if (!interface.isLegalToInline(&op, insertRegion,
+                                     shouldCloneInlinedRegion, valueMapping)) {
         LLVM_DEBUG({
           llvm::dbgs() << "* Illegal to inline because of op: ";
           op.dump();
@@ -113,7 +125,7 @@ static bool isLegalToInline(InlinerInterface &interface, Region *src,
       if (interface.shouldAnalyzeRecursively(&op) &&
           llvm::any_of(op.getRegions(), [&](Region &region) {
             return !isLegalToInline(interface, &region, insertRegion,
-                                    valueMapping);
+                                    shouldCloneInlinedRegion, valueMapping);
           }))
         return false;
     }
@@ -128,9 +140,11 @@ static bool isLegalToInline(InlinerInterface &interface, Region *src,
 LogicalResult mlir::inlineRegion(InlinerInterface &interface, Region *src,
                                  Operation *inlinePoint,
                                  BlockAndValueMapping &mapper,
-                                 ArrayRef<Value> resultsToReplace,
+                                 ValueRange resultsToReplace,
+                                 TypeRange regionResultTypes,
                                  Optional<Location> inlineLoc,
                                  bool shouldCloneInlinedRegion) {
+  assert(resultsToReplace.size() == regionResultTypes.size());
   // We expect the region to have at least one block.
   if (src->empty())
     return failure();
@@ -148,8 +162,10 @@ LogicalResult mlir::inlineRegion(InlinerInterface &interface, Region *src,
   Region *insertRegion = insertBlock->getParent();
 
   // Check that the operations within the source region are valid to inline.
-  if (!interface.isLegalToInline(insertRegion, src, mapper) ||
-      !isLegalToInline(interface, src, insertRegion, mapper))
+  if (!interface.isLegalToInline(insertRegion, src, shouldCloneInlinedRegion,
+                                 mapper) ||
+      !isLegalToInline(interface, src, insertRegion, shouldCloneInlinedRegion,
+                       mapper))
     return failure();
 
   // Split the insertion block.
@@ -188,7 +204,8 @@ LogicalResult mlir::inlineRegion(InlinerInterface &interface, Region *src,
   if (std::next(newBlocks.begin()) == newBlocks.end()) {
     // Have the interface handle the terminator of this block.
     auto *firstBlockTerminator = firstNewBlock->getTerminator();
-    interface.handleTerminator(firstBlockTerminator, resultsToReplace);
+    interface.handleTerminator(firstBlockTerminator,
+                               llvm::to_vector<6>(resultsToReplace));
     firstBlockTerminator->erase();
 
     // Merge the post insert block into the cloned entry block.
@@ -198,9 +215,9 @@ LogicalResult mlir::inlineRegion(InlinerInterface &interface, Region *src,
   } else {
     // Otherwise, there were multiple blocks inlined. Add arguments to the post
     // insertion block to represent the results to replace.
-    for (Value resultToRepl : resultsToReplace) {
-      resultToRepl->replaceAllUsesWith(
-          postInsertBlock->addArgument(resultToRepl->getType()));
+    for (auto resultToRepl : llvm::enumerate(resultsToReplace)) {
+      resultToRepl.value().replaceAllUsesWith(postInsertBlock->addArgument(
+          regionResultTypes[resultToRepl.index()]));
     }
 
     /// Handle the terminators for each of the new blocks.
@@ -220,8 +237,8 @@ LogicalResult mlir::inlineRegion(InlinerInterface &interface, Region *src,
 /// in-favor of the region arguments when inlining.
 LogicalResult mlir::inlineRegion(InlinerInterface &interface, Region *src,
                                  Operation *inlinePoint,
-                                 ArrayRef<Value> inlinedOperands,
-                                 ArrayRef<Value> resultsToReplace,
+                                 ValueRange inlinedOperands,
+                                 ValueRange resultsToReplace,
                                  Optional<Location> inlineLoc,
                                  bool shouldCloneInlinedRegion) {
   // We expect the region to have at least one block.
@@ -238,14 +255,15 @@ LogicalResult mlir::inlineRegion(InlinerInterface &interface, Region *src,
     // Verify that the types of the provided values match the function argument
     // types.
     BlockArgument regionArg = entryBlock->getArgument(i);
-    if (inlinedOperands[i]->getType() != regionArg->getType())
+    if (inlinedOperands[i].getType() != regionArg.getType())
       return failure();
     mapper.map(regionArg, inlinedOperands[i]);
   }
 
   // Call into the main region inliner function.
   return inlineRegion(interface, src, inlinePoint, mapper, resultsToReplace,
-                      inlineLoc, shouldCloneInlinedRegion);
+                      resultsToReplace.getTypes(), inlineLoc,
+                      shouldCloneInlinedRegion);
 }
 
 /// Utility function used to generate a cast operation from the given interface,
@@ -284,12 +302,12 @@ LogicalResult mlir::inlineCall(InlinerInterface &interface,
   if (src->empty())
     return failure();
   auto *entryBlock = &src->front();
-  ArrayRef<Type> callableResultTypes = callable.getCallableResults(src);
+  ArrayRef<Type> callableResultTypes = callable.getCallableResults();
 
   // Make sure that the number of arguments and results matchup between the call
   // and the region.
   SmallVector<Value, 8> callOperands(call.getArgOperands());
-  SmallVector<Value, 8> callResults(call.getOperation()->getResults());
+  SmallVector<Value, 8> callResults(call->getResults());
   if (callOperands.size() != entryBlock->getNumArguments() ||
       callResults.size() != callableResultTypes.size())
     return failure();
@@ -302,7 +320,7 @@ LogicalResult mlir::inlineCall(InlinerInterface &interface,
   // Functor used to cleanup generated state on failure.
   auto cleanupState = [&] {
     for (auto *op : castOps) {
-      op->getResult(0)->replaceAllUsesWith(op->getOperand(0));
+      op->getResult(0).replaceAllUsesWith(op->getOperand(0));
       op->erase();
     }
     return failure();
@@ -311,7 +329,7 @@ LogicalResult mlir::inlineCall(InlinerInterface &interface,
   // Builder used for any conversion operations that need to be materialized.
   OpBuilder castBuilder(call);
   Location castLoc = call.getLoc();
-  auto *callInterface = interface.getInterfaceFor(call.getDialect());
+  const auto *callInterface = interface.getInterfaceFor(call->getDialect());
 
   // Map the provided call operands to the arguments of the region.
   BlockAndValueMapping mapper;
@@ -321,8 +339,8 @@ LogicalResult mlir::inlineCall(InlinerInterface &interface,
 
     // If the call operand doesn't match the expected region argument, try to
     // generate a cast.
-    Type regionArgType = regionArg->getType();
-    if (operand->getType() != regionArgType) {
+    Type regionArgType = regionArg.getType();
+    if (operand.getType() != regionArgType) {
       if (!(operand = materializeConversion(callInterface, castOps, castBuilder,
                                             operand, regionArgType, castLoc)))
         return cleanupState();
@@ -330,27 +348,32 @@ LogicalResult mlir::inlineCall(InlinerInterface &interface,
     mapper.map(regionArg, operand);
   }
 
-  // Ensure that the resultant values of the call, match the callable.
+  // Ensure that the resultant values of the call match the callable.
   castBuilder.setInsertionPointAfter(call);
   for (unsigned i = 0, e = callResults.size(); i != e; ++i) {
     Value callResult = callResults[i];
-    if (callResult->getType() == callableResultTypes[i])
+    if (callResult.getType() == callableResultTypes[i])
       continue;
 
     // Generate a conversion that will produce the original type, so that the IR
     // is still valid after the original call gets replaced.
     Value castResult =
         materializeConversion(callInterface, castOps, castBuilder, callResult,
-                              callResult->getType(), castLoc);
+                              callResult.getType(), castLoc);
     if (!castResult)
       return cleanupState();
-    callResult->replaceAllUsesWith(castResult);
-    castResult->getDefiningOp()->replaceUsesOfWith(castResult, callResult);
+    callResult.replaceAllUsesWith(castResult);
+    castResult.getDefiningOp()->replaceUsesOfWith(castResult, callResult);
   }
+
+  // Check that it is legal to inline the callable into the call.
+  if (!interface.isLegalToInline(call, callable, shouldCloneInlinedRegion))
+    return cleanupState();
 
   // Attempt to inline the call.
   if (failed(inlineRegion(interface, src, call, mapper, callResults,
-                          call.getLoc(), shouldCloneInlinedRegion)))
+                          callableResultTypes, call.getLoc(),
+                          shouldCloneInlinedRegion)))
     return cleanupState();
   return success();
 }

@@ -35,6 +35,10 @@ public:
   }
 
   void Visit(const Stmt *S) {
+    if (!S) {
+      OS << "<<<NULL>>>";
+      return;
+    }
     OS << S->getStmtClassName();
     if (auto *E = dyn_cast<DeclRefExpr>(S)) {
       OS << " '" << E->getDecl()->getDeclName() << "'";
@@ -51,7 +55,14 @@ public:
     OS << C->getCommentKindName();
   }
 
-  void Visit(const CXXCtorInitializer *Init) { OS << "CXXCtorInitializer"; }
+  void Visit(const CXXCtorInitializer *Init) {
+    OS << "CXXCtorInitializer";
+    if (const auto *F = Init->getAnyMember()) {
+      OS << " '" << F->getNameAsString() << "'";
+    } else if (auto const *TSI = Init->getTypeSourceInfo()) {
+      OS << " '" << TSI->getType().getAsString() << "'";
+    }
+  }
 
   void Visit(const Attr *A) {
     switch (A->getKind()) {
@@ -68,6 +79,14 @@ public:
   void Visit(const TemplateArgument &A, SourceRange R = {},
              const Decl *From = nullptr, const char *Label = nullptr) {
     OS << "TemplateArgument";
+    switch (A.getKind()) {
+    case TemplateArgument::Type: {
+      OS << " type " << A.getAsType().getAsString();
+      break;
+    }
+    default:
+      break;
+    }
   }
 
   template <typename... T> void Visit(T...) {}
@@ -96,7 +115,7 @@ template <typename... NodeType> std::string dumpASTString(NodeType &&... N) {
 }
 
 template <typename... NodeType>
-std::string dumpASTString(ast_type_traits::TraversalKind TK, NodeType &&... N) {
+std::string dumpASTString(TraversalKind TK, NodeType &&... N) {
   std::string Buffer;
   llvm::raw_string_ostream OS(Buffer);
 
@@ -120,15 +139,13 @@ const FunctionDecl *getFunctionNode(clang::ASTUnit *AST,
 
 template <typename T> struct Verifier {
   static void withDynNode(T Node, const std::string &DumpString) {
-    EXPECT_EQ(dumpASTString(ast_type_traits::DynTypedNode::create(Node)),
-              DumpString);
+    EXPECT_EQ(dumpASTString(DynTypedNode::create(Node)), DumpString);
   }
 };
 
 template <typename T> struct Verifier<T *> {
   static void withDynNode(T *Node, const std::string &DumpString) {
-    EXPECT_EQ(dumpASTString(ast_type_traits::DynTypedNode::create(*Node)),
-              DumpString);
+    EXPECT_EQ(dumpASTString(DynTypedNode::create(*Node)), DumpString);
   }
 };
 
@@ -220,7 +237,7 @@ WarnUnusedResultAttr
 
   verifyWithDynNode(Init,
                     R"cpp(
-CXXCtorInitializer
+CXXCtorInitializer 'm_number'
 `-IntegerLiteral
 )cpp");
 
@@ -245,7 +262,8 @@ FullComment
 
   verifyWithDynNode(TA,
                     R"cpp(
-TemplateArgument
+TemplateArgument type int
+`-BuiltinType
 )cpp");
 
   Func = getFunctionNode(AST.get(), "parmvardecl_attr");
@@ -260,7 +278,442 @@ TemplateArgument
             19u);
 }
 
-TEST(Traverse, IgnoreUnlessSpelledInSource) {
+TEST(Traverse, IgnoreUnlessSpelledInSourceVars) {
+
+  auto AST = buildASTFromCode(R"cpp(
+
+struct String
+{
+    String(const char*, int = -1) {}
+
+    int overloaded() const;
+    int& overloaded();
+};
+
+void stringConstruct()
+{
+    String s = "foo";
+    s = "bar";
+}
+
+void overloadCall()
+{
+   String s = "foo";
+   (s).overloaded();
+}
+
+struct C1 {};
+struct C2 { operator C1(); };
+
+void conversionOperator()
+{
+    C2* c2;
+    C1 c1 = (*c2);
+}
+
+template <unsigned alignment>
+void template_test() {
+  static_assert(alignment, "");
+}
+void actual_template_test() {
+  template_test<4>();
+}
+
+struct OneParamCtor {
+  explicit OneParamCtor(int);
+};
+struct TwoParamCtor {
+  explicit TwoParamCtor(int, int);
+};
+
+void varDeclCtors() {
+  {
+  auto var1 = OneParamCtor(5);
+  auto var2 = TwoParamCtor(6, 7);
+  }
+  {
+  OneParamCtor var3(5);
+  TwoParamCtor var4(6, 7);
+  }
+  int i = 0;
+  {
+  auto var5 = OneParamCtor(i);
+  auto var6 = TwoParamCtor(i, 7);
+  }
+  {
+  OneParamCtor var7(i);
+  TwoParamCtor var8(i, 7);
+  }
+}
+
+)cpp");
+
+  {
+    auto FN =
+        ast_matchers::match(functionDecl(hasName("stringConstruct")).bind("fn"),
+                            AST->getASTContext());
+    EXPECT_EQ(FN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, FN[0].getNodeAs<Decl>("fn")),
+              R"cpp(
+FunctionDecl 'stringConstruct'
+`-CompoundStmt
+  |-DeclStmt
+  | `-VarDecl 's'
+  |   `-ExprWithCleanups
+  |     `-CXXConstructExpr
+  |       `-MaterializeTemporaryExpr
+  |         `-ImplicitCastExpr
+  |           `-CXXConstructExpr
+  |             |-ImplicitCastExpr
+  |             | `-StringLiteral
+  |             `-CXXDefaultArgExpr
+  `-ExprWithCleanups
+    `-CXXOperatorCallExpr
+      |-ImplicitCastExpr
+      | `-DeclRefExpr 'operator='
+      |-DeclRefExpr 's'
+      `-MaterializeTemporaryExpr
+        `-CXXConstructExpr
+          |-ImplicitCastExpr
+          | `-StringLiteral
+          `-CXXDefaultArgExpr
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            FN[0].getNodeAs<Decl>("fn")),
+              R"cpp(
+FunctionDecl 'stringConstruct'
+`-CompoundStmt
+  |-DeclStmt
+  | `-VarDecl 's'
+  |   `-StringLiteral
+  `-CXXOperatorCallExpr
+    |-DeclRefExpr 'operator='
+    |-DeclRefExpr 's'
+    `-StringLiteral
+)cpp");
+  }
+
+  {
+    auto FN =
+        ast_matchers::match(functionDecl(hasName("overloadCall")).bind("fn"),
+                            AST->getASTContext());
+    EXPECT_EQ(FN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, FN[0].getNodeAs<Decl>("fn")),
+              R"cpp(
+FunctionDecl 'overloadCall'
+`-CompoundStmt
+  |-DeclStmt
+  | `-VarDecl 's'
+  |   `-ExprWithCleanups
+  |     `-CXXConstructExpr
+  |       `-MaterializeTemporaryExpr
+  |         `-ImplicitCastExpr
+  |           `-CXXConstructExpr
+  |             |-ImplicitCastExpr
+  |             | `-StringLiteral
+  |             `-CXXDefaultArgExpr
+  `-CXXMemberCallExpr
+    `-MemberExpr
+      `-ParenExpr
+        `-DeclRefExpr 's'
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            FN[0].getNodeAs<Decl>("fn")),
+              R"cpp(
+FunctionDecl 'overloadCall'
+`-CompoundStmt
+  |-DeclStmt
+  | `-VarDecl 's'
+  |   `-StringLiteral
+  `-CXXMemberCallExpr
+    `-MemberExpr
+      `-DeclRefExpr 's'
+)cpp");
+  }
+
+  {
+    auto FN = ast_matchers::match(
+        functionDecl(hasName("conversionOperator"),
+                     hasDescendant(varDecl(hasName("c1")).bind("var"))),
+        AST->getASTContext());
+    EXPECT_EQ(FN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, FN[0].getNodeAs<Decl>("var")),
+              R"cpp(
+VarDecl 'c1'
+`-ExprWithCleanups
+  `-CXXConstructExpr
+    `-MaterializeTemporaryExpr
+      `-ImplicitCastExpr
+        `-CXXMemberCallExpr
+          `-MemberExpr
+            `-ParenExpr
+              `-UnaryOperator
+                `-ImplicitCastExpr
+                  `-DeclRefExpr 'c2'
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            FN[0].getNodeAs<Decl>("var")),
+              R"cpp(
+VarDecl 'c1'
+`-UnaryOperator
+  `-DeclRefExpr 'c2'
+)cpp");
+  }
+
+  {
+    auto FN = ast_matchers::match(
+        functionDecl(hasName("template_test"),
+                     hasDescendant(staticAssertDecl().bind("staticAssert"))),
+        AST->getASTContext());
+    EXPECT_EQ(FN.size(), 2u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, FN[1].getNodeAs<Decl>("staticAssert")),
+              R"cpp(
+StaticAssertDecl
+|-ImplicitCastExpr
+| `-SubstNonTypeTemplateParmExpr
+|   |-NonTypeTemplateParmDecl 'alignment'
+|   `-IntegerLiteral
+`-StringLiteral
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            FN[1].getNodeAs<Decl>("staticAssert")),
+              R"cpp(
+StaticAssertDecl
+|-IntegerLiteral
+`-StringLiteral
+)cpp");
+  }
+
+  auto varChecker = [&AST](StringRef varName, StringRef SemanticDump,
+                           StringRef SyntacticDump) {
+    auto FN = ast_matchers::match(
+        functionDecl(
+            hasName("varDeclCtors"),
+            forEachDescendant(varDecl(hasName(varName)).bind("varDeclCtor"))),
+        AST->getASTContext());
+    EXPECT_EQ(FN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, FN[0].getNodeAs<Decl>("varDeclCtor")),
+              SemanticDump);
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            FN[0].getNodeAs<Decl>("varDeclCtor")),
+              SyntacticDump);
+  };
+
+  varChecker("var1",
+             R"cpp(
+VarDecl 'var1'
+`-ExprWithCleanups
+  `-CXXConstructExpr
+    `-MaterializeTemporaryExpr
+      `-CXXFunctionalCastExpr
+        `-CXXConstructExpr
+          `-IntegerLiteral
+)cpp",
+             R"cpp(
+VarDecl 'var1'
+`-CXXConstructExpr
+  `-IntegerLiteral
+)cpp");
+
+  varChecker("var2",
+             R"cpp(
+VarDecl 'var2'
+`-ExprWithCleanups
+  `-CXXConstructExpr
+    `-MaterializeTemporaryExpr
+      `-CXXTemporaryObjectExpr
+        |-IntegerLiteral
+        `-IntegerLiteral
+)cpp",
+             R"cpp(
+VarDecl 'var2'
+`-CXXTemporaryObjectExpr
+  |-IntegerLiteral
+  `-IntegerLiteral
+)cpp");
+
+  varChecker("var3",
+             R"cpp(
+VarDecl 'var3'
+`-CXXConstructExpr
+  `-IntegerLiteral
+)cpp",
+             R"cpp(
+VarDecl 'var3'
+`-CXXConstructExpr
+  `-IntegerLiteral
+)cpp");
+
+  varChecker("var4",
+             R"cpp(
+VarDecl 'var4'
+`-CXXConstructExpr
+  |-IntegerLiteral
+  `-IntegerLiteral
+)cpp",
+             R"cpp(
+VarDecl 'var4'
+`-CXXConstructExpr
+  |-IntegerLiteral
+  `-IntegerLiteral
+)cpp");
+
+  varChecker("var5",
+             R"cpp(
+VarDecl 'var5'
+`-ExprWithCleanups
+  `-CXXConstructExpr
+    `-MaterializeTemporaryExpr
+      `-CXXFunctionalCastExpr
+        `-CXXConstructExpr
+          `-ImplicitCastExpr
+            `-DeclRefExpr 'i'
+)cpp",
+             R"cpp(
+VarDecl 'var5'
+`-CXXConstructExpr
+  `-DeclRefExpr 'i'
+)cpp");
+
+  varChecker("var6",
+             R"cpp(
+VarDecl 'var6'
+`-ExprWithCleanups
+  `-CXXConstructExpr
+    `-MaterializeTemporaryExpr
+      `-CXXTemporaryObjectExpr
+        |-ImplicitCastExpr
+        | `-DeclRefExpr 'i'
+        `-IntegerLiteral
+)cpp",
+             R"cpp(
+VarDecl 'var6'
+`-CXXTemporaryObjectExpr
+  |-DeclRefExpr 'i'
+  `-IntegerLiteral
+)cpp");
+
+  varChecker("var7",
+             R"cpp(
+VarDecl 'var7'
+`-CXXConstructExpr
+  `-ImplicitCastExpr
+    `-DeclRefExpr 'i'
+)cpp",
+             R"cpp(
+VarDecl 'var7'
+`-CXXConstructExpr
+  `-DeclRefExpr 'i'
+)cpp");
+
+  varChecker("var8",
+             R"cpp(
+VarDecl 'var8'
+`-CXXConstructExpr
+  |-ImplicitCastExpr
+  | `-DeclRefExpr 'i'
+  `-IntegerLiteral
+)cpp",
+             R"cpp(
+VarDecl 'var8'
+`-CXXConstructExpr
+  |-DeclRefExpr 'i'
+  `-IntegerLiteral
+)cpp");
+}
+
+TEST(Traverse, IgnoreUnlessSpelledInSourceStructs) {
+  auto AST = buildASTFromCode(R"cpp(
+
+struct MyStruct {
+  MyStruct();
+  MyStruct(int i) {
+    MyStruct();
+  }
+  ~MyStruct();
+};
+
+)cpp");
+
+  auto BN = ast_matchers::match(
+      cxxConstructorDecl(hasName("MyStruct"),
+                         hasParameter(0, parmVarDecl(hasType(isInteger()))))
+          .bind("ctor"),
+      AST->getASTContext());
+  EXPECT_EQ(BN.size(), 1u);
+
+  EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                          BN[0].getNodeAs<Decl>("ctor")),
+            R"cpp(
+CXXConstructorDecl 'MyStruct'
+|-ParmVarDecl 'i'
+`-CompoundStmt
+  `-CXXTemporaryObjectExpr
+)cpp");
+
+  EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("ctor")),
+            R"cpp(
+CXXConstructorDecl 'MyStruct'
+|-ParmVarDecl 'i'
+`-CompoundStmt
+  `-ExprWithCleanups
+    `-CXXBindTemporaryExpr
+      `-CXXTemporaryObjectExpr
+)cpp");
+}
+
+TEST(Traverse, IgnoreUnlessSpelledInSourceReturnStruct) {
+
+  auto AST = buildASTFromCode(R"cpp(
+struct Retval {
+  Retval() {}
+  ~Retval() {}
+};
+
+Retval someFun();
+
+void foo()
+{
+    someFun();
+}
+)cpp");
+
+  auto BN = ast_matchers::match(functionDecl(hasName("foo")).bind("fn"),
+                                AST->getASTContext());
+  EXPECT_EQ(BN.size(), 1u);
+
+  EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                          BN[0].getNodeAs<Decl>("fn")),
+            R"cpp(
+FunctionDecl 'foo'
+`-CompoundStmt
+  `-CallExpr
+    `-DeclRefExpr 'someFun'
+)cpp");
+
+  EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("fn")),
+            R"cpp(
+FunctionDecl 'foo'
+`-CompoundStmt
+  `-ExprWithCleanups
+    `-CXXBindTemporaryExpr
+      `-CallExpr
+        `-ImplicitCastExpr
+          `-DeclRefExpr 'someFun'
+)cpp");
+}
+
+TEST(Traverse, IgnoreUnlessSpelledInSourceReturns) {
 
   auto AST = buildASTFromCode(R"cpp(
 
@@ -342,9 +795,7 @@ B func12() {
 
   {
     auto FN = getFunctionNode("func1");
-
-    EXPECT_EQ(dumpASTString(ast_type_traits::TK_AsIs, FN),
-              R"cpp(
+    llvm::StringRef Expected = R"cpp(
 FunctionDecl 'func1'
 `-CompoundStmt
   `-ReturnStmt
@@ -354,97 +805,104 @@ FunctionDecl 'func1'
           `-ImplicitCastExpr
             `-CXXConstructExpr
               `-IntegerLiteral
-)cpp");
+)cpp";
 
-    EXPECT_EQ(
-        dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource, FN),
-        R"cpp(
+    EXPECT_EQ(dumpASTString(TK_AsIs, FN), Expected);
+
+    Expected = R"cpp(
 FunctionDecl 'func1'
 `-CompoundStmt
   `-ReturnStmt
     `-IntegerLiteral
-)cpp");
+)cpp";
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource, FN), Expected);
   }
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func2")),
-            R"cpp(
+  llvm::StringRef Expected = R"cpp(
 FunctionDecl 'func2'
 `-CompoundStmt
   `-ReturnStmt
     `-CXXTemporaryObjectExpr
       `-IntegerLiteral
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func2")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func3")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func3'
 `-CompoundStmt
   `-ReturnStmt
-    `-CXXFunctionalCastExpr
+    `-CXXConstructExpr
       `-IntegerLiteral
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func3")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func4")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func4'
 `-CompoundStmt
   `-ReturnStmt
     `-CXXTemporaryObjectExpr
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func4")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func5")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func5'
 `-CompoundStmt
   `-ReturnStmt
     `-CXXTemporaryObjectExpr
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func5")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func6")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func6'
 `-CompoundStmt
   `-ReturnStmt
     `-CXXTemporaryObjectExpr
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func6")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func7")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func7'
 `-CompoundStmt
   `-ReturnStmt
     `-CXXTemporaryObjectExpr
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func7")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func8")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func8'
 `-CompoundStmt
   `-ReturnStmt
     `-CXXFunctionalCastExpr
       `-InitListExpr
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func8")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func9")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func9'
 `-CompoundStmt
   `-ReturnStmt
     `-CXXFunctionalCastExpr
       `-InitListExpr
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func9")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func10")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func10'
 `-CompoundStmt
   |-DeclStmt
@@ -452,11 +910,12 @@ FunctionDecl 'func10'
   |   `-CXXConstructExpr
   `-ReturnStmt
     `-DeclRefExpr 'a'
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func10")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func11")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func11'
 `-CompoundStmt
   |-DeclStmt
@@ -464,11 +923,12 @@ FunctionDecl 'func11'
   |   `-CXXConstructExpr
   `-ReturnStmt
     `-DeclRefExpr 'b'
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func11")),
+      Expected);
 
-  EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource,
-                          getFunctionNode("func12")),
-            R"cpp(
+  Expected = R"cpp(
 FunctionDecl 'func12'
 `-CompoundStmt
   |-DeclStmt
@@ -476,7 +936,10 @@ FunctionDecl 'func12'
   |   `-CXXConstructExpr
   `-ReturnStmt
     `-DeclRefExpr 'c'
-)cpp");
+)cpp";
+  EXPECT_EQ(
+      dumpASTString(TK_IgnoreUnlessSpelledInSource, getFunctionNode("func12")),
+      Expected);
 }
 
 TEST(Traverse, LambdaUnlessSpelledInSource) {
@@ -521,8 +984,7 @@ struct SomeStruct {
   {
     auto L = getLambdaNode("captures");
 
-    EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource, L),
-              R"cpp(
+    llvm::StringRef Expected = R"cpp(
 LambdaExpr
 |-DeclRefExpr 'a'
 |-DeclRefExpr 'b'
@@ -534,10 +996,10 @@ LambdaExpr
 |-ParmVarDecl 'h'
 | `-IntegerLiteral
 `-CompoundStmt
-)cpp");
+)cpp";
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource, L), Expected);
 
-    EXPECT_EQ(dumpASTString(ast_type_traits::TK_AsIs, L),
-              R"cpp(
+    Expected = R"cpp(
 LambdaExpr
 |-CXXRecordDecl ''
 | |-CXXMethodDecl 'operator()'
@@ -557,43 +1019,716 @@ LambdaExpr
 | `-DeclRefExpr 'd'
 |-DeclRefExpr 'f'
 `-CompoundStmt
-)cpp");
+)cpp";
+    EXPECT_EQ(dumpASTString(TK_AsIs, L), Expected);
   }
 
   {
     auto L = getLambdaNode("templated");
 
-    EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource, L),
-              R"cpp(
+    llvm::StringRef Expected = R"cpp(
 LambdaExpr
 |-DeclRefExpr 'a'
 |-TemplateTypeParmDecl 'T'
 |-ParmVarDecl 't'
 `-CompoundStmt
-)cpp");
+)cpp";
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource, L), Expected);
   }
 
   {
     auto L = getLambdaNode("capture_this");
 
-    EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource, L),
-              R"cpp(
+    llvm::StringRef Expected = R"cpp(
 LambdaExpr
 |-CXXThisExpr
 `-CompoundStmt
-)cpp");
+)cpp";
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource, L), Expected);
   }
 
   {
     auto L = getLambdaNode("capture_this_copy");
 
-    EXPECT_EQ(dumpASTString(ast_type_traits::TK_IgnoreUnlessSpelledInSource, L),
-              R"cpp(
+    llvm::StringRef Expected = R"cpp(
 LambdaExpr
 |-VarDecl 'self'
 | `-UnaryOperator
 |   `-CXXThisExpr
 `-CompoundStmt
+)cpp";
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource, L), Expected);
+  }
+}
+
+TEST(Traverse, IgnoreUnlessSpelledInSourceImplicit) {
+  {
+    auto AST = buildASTFromCode(R"cpp(
+int i = 0;
+)cpp");
+    const auto *TUDecl = AST->getASTContext().getTranslationUnitDecl();
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource, TUDecl),
+              R"cpp(
+TranslationUnitDecl
+`-VarDecl 'i'
+  `-IntegerLiteral
+)cpp");
+  }
+
+  auto AST2 = buildASTFromCodeWithArgs(R"cpp(
+struct Simple {
+};
+struct Other {
+};
+
+struct Record : Simple, Other {
+  Record() : Simple(), m_i(42) {}
+private:
+  int m_i;
+  int m_i2 = 42;
+  Simple m_s;
+};
+
+struct NonTrivial {
+    NonTrivial() {}
+    NonTrivial(NonTrivial&) {}
+    NonTrivial& operator=(NonTrivial&) { return *this; }
+
+    ~NonTrivial() {}
+};
+
+struct ContainsArray {
+    NonTrivial arr[2];
+    int irr[2];
+    ContainsArray& operator=(ContainsArray &) = default;
+};
+
+void copyIt()
+{
+    ContainsArray ca;
+    ContainsArray ca2;
+    ca2 = ca;
+}
+
+void forLoop()
+{
+    int arr[2];
+    for (auto i : arr)
+    {
+
+    }
+    for (auto& a = arr; auto i : a)
+    {
+
+    }
+}
+
+struct DefaultedAndDeleted {
+  NonTrivial nt;
+  DefaultedAndDeleted() = default;
+  ~DefaultedAndDeleted() = default;
+  DefaultedAndDeleted(DefaultedAndDeleted &) = default;
+  DefaultedAndDeleted& operator=(DefaultedAndDeleted &) = default;
+  DefaultedAndDeleted(DefaultedAndDeleted &&) = delete;
+  DefaultedAndDeleted& operator=(DefaultedAndDeleted &&) = delete;
+};
+
+void copyIt2()
+{
+    DefaultedAndDeleted ca;
+    DefaultedAndDeleted ca2;
+    ca2 = ca;
+}
+
+void hasDefaultArg(int i, int j = 0)
+{
+}
+void callDefaultArg()
+{
+  hasDefaultArg(42);
+}
+)cpp",
+                                       {"-std=c++20"});
+
+  {
+    auto BN = ast_matchers::match(
+        cxxRecordDecl(hasName("Record"), unless(isImplicit())).bind("rec"),
+        AST2->getASTContext());
+    EXPECT_EQ(BN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+CXXRecordDecl 'Record'
+|-CXXRecordDecl 'Record'
+|-CXXConstructorDecl 'Record'
+| |-CXXCtorInitializer 'struct Simple'
+| | `-CXXConstructExpr
+| |-CXXCtorInitializer 'struct Other'
+| | `-CXXConstructExpr
+| |-CXXCtorInitializer 'm_i'
+| | `-IntegerLiteral
+| |-CXXCtorInitializer 'm_i2'
+| | `-CXXDefaultInitExpr
+| |-CXXCtorInitializer 'm_s'
+| | `-CXXConstructExpr
+| `-CompoundStmt
+|-AccessSpecDecl
+|-FieldDecl 'm_i'
+|-FieldDecl 'm_i2'
+| `-IntegerLiteral
+`-FieldDecl 'm_s'
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+CXXRecordDecl 'Record'
+|-CXXConstructorDecl 'Record'
+| |-CXXCtorInitializer 'struct Simple'
+| | `-CXXConstructExpr
+| |-CXXCtorInitializer 'm_i'
+| | `-IntegerLiteral
+| `-CompoundStmt
+|-AccessSpecDecl
+|-FieldDecl 'm_i'
+|-FieldDecl 'm_i2'
+| `-IntegerLiteral
+`-FieldDecl 'm_s'
+)cpp");
+  }
+  {
+    auto BN = ast_matchers::match(
+        cxxRecordDecl(hasName("ContainsArray"), unless(isImplicit()))
+            .bind("rec"),
+        AST2->getASTContext());
+    EXPECT_EQ(BN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+CXXRecordDecl 'ContainsArray'
+|-CXXRecordDecl 'ContainsArray'
+|-FieldDecl 'arr'
+|-FieldDecl 'irr'
+|-CXXMethodDecl 'operator='
+| |-ParmVarDecl ''
+| `-CompoundStmt
+|   |-ForStmt
+|   | |-DeclStmt
+|   | | `-VarDecl '__i0'
+|   | |   `-IntegerLiteral
+|   | |-<<<NULL>>>
+|   | |-BinaryOperator
+|   | | |-ImplicitCastExpr
+|   | | | `-DeclRefExpr '__i0'
+|   | | `-IntegerLiteral
+|   | |-UnaryOperator
+|   | | `-DeclRefExpr '__i0'
+|   | `-CXXMemberCallExpr
+|   |   |-MemberExpr
+|   |   | `-ArraySubscriptExpr
+|   |   |   |-ImplicitCastExpr
+|   |   |   | `-MemberExpr
+|   |   |   |   `-CXXThisExpr
+|   |   |   `-ImplicitCastExpr
+|   |   |     `-DeclRefExpr '__i0'
+|   |   `-ArraySubscriptExpr
+|   |     |-ImplicitCastExpr
+|   |     | `-MemberExpr
+|   |     |   `-DeclRefExpr ''
+|   |     `-ImplicitCastExpr
+|   |       `-DeclRefExpr '__i0'
+|   |-CallExpr
+|   | |-ImplicitCastExpr
+|   | | `-DeclRefExpr '__builtin_memcpy'
+|   | |-ImplicitCastExpr
+|   | | `-UnaryOperator
+|   | |   `-MemberExpr
+|   | |     `-CXXThisExpr
+|   | |-ImplicitCastExpr
+|   | | `-UnaryOperator
+|   | |   `-MemberExpr
+|   | |     `-DeclRefExpr ''
+|   | `-IntegerLiteral
+|   `-ReturnStmt
+|     `-UnaryOperator
+|       `-CXXThisExpr
+|-CXXConstructorDecl 'ContainsArray'
+| `-ParmVarDecl ''
+|-CXXDestructorDecl '~ContainsArray'
+| `-CompoundStmt
+`-CXXConstructorDecl 'ContainsArray'
+  |-CXXCtorInitializer 'arr'
+  | `-CXXConstructExpr
+  `-CompoundStmt
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+CXXRecordDecl 'ContainsArray'
+|-FieldDecl 'arr'
+|-FieldDecl 'irr'
+`-CXXMethodDecl 'operator='
+  `-ParmVarDecl ''
+)cpp");
+  }
+  {
+    auto BN = ast_matchers::match(functionDecl(hasName("forLoop")).bind("func"),
+                                  AST2->getASTContext());
+    EXPECT_EQ(BN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("func")),
+              R"cpp(
+FunctionDecl 'forLoop'
+`-CompoundStmt
+  |-DeclStmt
+  | `-VarDecl 'arr'
+  |-CXXForRangeStmt
+  | |-<<<NULL>>>
+  | |-DeclStmt
+  | | `-VarDecl '__range1'
+  | |   `-DeclRefExpr 'arr'
+  | |-DeclStmt
+  | | `-VarDecl '__begin1'
+  | |   `-ImplicitCastExpr
+  | |     `-DeclRefExpr '__range1'
+  | |-DeclStmt
+  | | `-VarDecl '__end1'
+  | |   `-BinaryOperator
+  | |     |-ImplicitCastExpr
+  | |     | `-DeclRefExpr '__range1'
+  | |     `-IntegerLiteral
+  | |-BinaryOperator
+  | | |-ImplicitCastExpr
+  | | | `-DeclRefExpr '__begin1'
+  | | `-ImplicitCastExpr
+  | |   `-DeclRefExpr '__end1'
+  | |-UnaryOperator
+  | | `-DeclRefExpr '__begin1'
+  | |-DeclStmt
+  | | `-VarDecl 'i'
+  | |   `-ImplicitCastExpr
+  | |     `-UnaryOperator
+  | |       `-ImplicitCastExpr
+  | |         `-DeclRefExpr '__begin1'
+  | `-CompoundStmt
+  `-CXXForRangeStmt
+    |-DeclStmt
+    | `-VarDecl 'a'
+    |   `-DeclRefExpr 'arr'
+    |-DeclStmt
+    | `-VarDecl '__range1'
+    |   `-DeclRefExpr 'a'
+    |-DeclStmt
+    | `-VarDecl '__begin1'
+    |   `-ImplicitCastExpr
+    |     `-DeclRefExpr '__range1'
+    |-DeclStmt
+    | `-VarDecl '__end1'
+    |   `-BinaryOperator
+    |     |-ImplicitCastExpr
+    |     | `-DeclRefExpr '__range1'
+    |     `-IntegerLiteral
+    |-BinaryOperator
+    | |-ImplicitCastExpr
+    | | `-DeclRefExpr '__begin1'
+    | `-ImplicitCastExpr
+    |   `-DeclRefExpr '__end1'
+    |-UnaryOperator
+    | `-DeclRefExpr '__begin1'
+    |-DeclStmt
+    | `-VarDecl 'i'
+    |   `-ImplicitCastExpr
+    |     `-UnaryOperator
+    |       `-ImplicitCastExpr
+    |         `-DeclRefExpr '__begin1'
+    `-CompoundStmt
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            BN[0].getNodeAs<Decl>("func")),
+              R"cpp(
+FunctionDecl 'forLoop'
+`-CompoundStmt
+  |-DeclStmt
+  | `-VarDecl 'arr'
+  |-CXXForRangeStmt
+  | |-<<<NULL>>>
+  | |-VarDecl 'i'
+  | |-DeclRefExpr 'arr'
+  | `-CompoundStmt
+  `-CXXForRangeStmt
+    |-DeclStmt
+    | `-VarDecl 'a'
+    |   `-DeclRefExpr 'arr'
+    |-VarDecl 'i'
+    |-DeclRefExpr 'a'
+    `-CompoundStmt
+)cpp");
+  }
+  {
+    auto BN = ast_matchers::match(
+        cxxRecordDecl(hasName("DefaultedAndDeleted"), unless(isImplicit()))
+            .bind("rec"),
+        AST2->getASTContext());
+    EXPECT_EQ(BN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+CXXRecordDecl 'DefaultedAndDeleted'
+|-CXXRecordDecl 'DefaultedAndDeleted'
+|-FieldDecl 'nt'
+|-CXXConstructorDecl 'DefaultedAndDeleted'
+| |-CXXCtorInitializer 'nt'
+| | `-CXXConstructExpr
+| `-CompoundStmt
+|-CXXDestructorDecl '~DefaultedAndDeleted'
+| `-CompoundStmt
+|-CXXConstructorDecl 'DefaultedAndDeleted'
+| `-ParmVarDecl ''
+|-CXXMethodDecl 'operator='
+| |-ParmVarDecl ''
+| `-CompoundStmt
+|   |-CXXMemberCallExpr
+|   | |-MemberExpr
+|   | | `-MemberExpr
+|   | |   `-CXXThisExpr
+|   | `-MemberExpr
+|   |   `-DeclRefExpr ''
+|   `-ReturnStmt
+|     `-UnaryOperator
+|       `-CXXThisExpr
+|-CXXConstructorDecl 'DefaultedAndDeleted'
+| `-ParmVarDecl ''
+`-CXXMethodDecl 'operator='
+  `-ParmVarDecl ''
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+CXXRecordDecl 'DefaultedAndDeleted'
+|-FieldDecl 'nt'
+|-CXXConstructorDecl 'DefaultedAndDeleted'
+|-CXXDestructorDecl '~DefaultedAndDeleted'
+|-CXXConstructorDecl 'DefaultedAndDeleted'
+| `-ParmVarDecl ''
+|-CXXMethodDecl 'operator='
+| `-ParmVarDecl ''
+|-CXXConstructorDecl 'DefaultedAndDeleted'
+| `-ParmVarDecl ''
+`-CXXMethodDecl 'operator='
+  `-ParmVarDecl ''
+)cpp");
+  }
+  {
+    auto BN = ast_matchers::match(
+        callExpr(callee(functionDecl(hasName("hasDefaultArg"))))
+            .bind("funcCall"),
+        AST2->getASTContext());
+    EXPECT_EQ(BN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<CallExpr>("funcCall")),
+              R"cpp(
+CallExpr
+|-ImplicitCastExpr
+| `-DeclRefExpr 'hasDefaultArg'
+|-IntegerLiteral
+`-CXXDefaultArgExpr
+)cpp");
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            BN[0].getNodeAs<CallExpr>("funcCall")),
+              R"cpp(
+CallExpr
+|-DeclRefExpr 'hasDefaultArg'
+`-IntegerLiteral
+)cpp");
+  }
+}
+
+TEST(Traverse, IgnoreUnlessSpelledInSourceTemplateInstantiations) {
+
+  auto AST = buildASTFromCode(R"cpp(
+template<typename T>
+struct TemplStruct {
+  TemplStruct() {}
+  ~TemplStruct() {}
+
+private:
+  T m_t;
+};
+
+template<typename T>
+T timesTwo(T input)
+{
+  return input * 2;
+}
+
+void instantiate()
+{
+  TemplStruct<int> ti;
+  TemplStruct<double> td;
+  (void)timesTwo<int>(2);
+  (void)timesTwo<double>(2);
+}
+
+template class TemplStruct<float>;
+
+extern template class TemplStruct<long>;
+
+template<> class TemplStruct<bool> {
+  TemplStruct() {}
+  ~TemplStruct() {}
+
+  void foo() {}
+private:
+  bool m_t;
+};
+
+// Explicit instantiation of template functions do not appear in the AST
+template float timesTwo(float);
+
+template<> bool timesTwo<bool>(bool) {
+  return true;
+}
+)cpp");
+  {
+    auto BN = ast_matchers::match(
+        classTemplateDecl(hasName("TemplStruct")).bind("rec"),
+        AST->getASTContext());
+    EXPECT_EQ(BN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+ClassTemplateDecl 'TemplStruct'
+|-TemplateTypeParmDecl 'T'
+`-CXXRecordDecl 'TemplStruct'
+  |-CXXConstructorDecl 'TemplStruct<T>'
+  | `-CompoundStmt
+  |-CXXDestructorDecl '~TemplStruct<T>'
+  | `-CompoundStmt
+  |-AccessSpecDecl
+  `-FieldDecl 'm_t'
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+ClassTemplateDecl 'TemplStruct'
+|-TemplateTypeParmDecl 'T'
+|-CXXRecordDecl 'TemplStruct'
+| |-CXXRecordDecl 'TemplStruct'
+| |-CXXConstructorDecl 'TemplStruct<T>'
+| | `-CompoundStmt
+| |-CXXDestructorDecl '~TemplStruct<T>'
+| | `-CompoundStmt
+| |-AccessSpecDecl
+| `-FieldDecl 'm_t'
+|-ClassTemplateSpecializationDecl 'TemplStruct'
+| |-TemplateArgument type int
+| | `-BuiltinType
+| |-CXXRecordDecl 'TemplStruct'
+| |-CXXConstructorDecl 'TemplStruct'
+| | `-CompoundStmt
+| |-CXXDestructorDecl '~TemplStruct'
+| | `-CompoundStmt
+| |-AccessSpecDecl
+| |-FieldDecl 'm_t'
+| `-CXXConstructorDecl 'TemplStruct'
+|   `-ParmVarDecl ''
+|-ClassTemplateSpecializationDecl 'TemplStruct'
+| |-TemplateArgument type double
+| | `-BuiltinType
+| |-CXXRecordDecl 'TemplStruct'
+| |-CXXConstructorDecl 'TemplStruct'
+| | `-CompoundStmt
+| |-CXXDestructorDecl '~TemplStruct'
+| | `-CompoundStmt
+| |-AccessSpecDecl
+| |-FieldDecl 'm_t'
+| `-CXXConstructorDecl 'TemplStruct'
+|   `-ParmVarDecl ''
+|-ClassTemplateSpecializationDecl 'TemplStruct'
+| |-TemplateArgument type float
+| | `-BuiltinType
+| |-CXXRecordDecl 'TemplStruct'
+| |-CXXConstructorDecl 'TemplStruct'
+| | `-CompoundStmt
+| |-CXXDestructorDecl '~TemplStruct'
+| | `-CompoundStmt
+| |-AccessSpecDecl
+| `-FieldDecl 'm_t'
+|-ClassTemplateSpecializationDecl 'TemplStruct'
+| |-TemplateArgument type long
+| | `-BuiltinType
+| |-CXXRecordDecl 'TemplStruct'
+| |-CXXConstructorDecl 'TemplStruct'
+| |-CXXDestructorDecl '~TemplStruct'
+| |-AccessSpecDecl
+| `-FieldDecl 'm_t'
+`-ClassTemplateSpecializationDecl 'TemplStruct'
+  |-TemplateArgument type _Bool
+  | `-BuiltinType
+  |-CXXRecordDecl 'TemplStruct'
+  |-CXXConstructorDecl 'TemplStruct'
+  | `-CompoundStmt
+  |-CXXDestructorDecl '~TemplStruct'
+  | `-CompoundStmt
+  |-CXXMethodDecl 'foo'
+  | `-CompoundStmt
+  |-AccessSpecDecl
+  `-FieldDecl 'm_t'
+)cpp");
+  }
+  {
+    auto BN = ast_matchers::match(
+        classTemplateSpecializationDecl(
+            hasTemplateArgument(
+                0, templateArgument(refersToType(asString("_Bool")))))
+            .bind("templSpec"),
+        AST->getASTContext());
+    EXPECT_EQ(BN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("templSpec")),
+              R"cpp(
+ClassTemplateSpecializationDecl 'TemplStruct'
+|-TemplateArgument type _Bool
+| `-BuiltinType
+|-CXXRecordDecl 'TemplStruct'
+|-CXXConstructorDecl 'TemplStruct'
+| `-CompoundStmt
+|-CXXDestructorDecl '~TemplStruct'
+| `-CompoundStmt
+|-CXXMethodDecl 'foo'
+| `-CompoundStmt
+|-AccessSpecDecl
+`-FieldDecl 'm_t'
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            BN[0].getNodeAs<Decl>("templSpec")),
+              R"cpp(
+ClassTemplateSpecializationDecl 'TemplStruct'
+|-TemplateArgument type _Bool
+| `-BuiltinType
+|-CXXConstructorDecl 'TemplStruct'
+| `-CompoundStmt
+|-CXXDestructorDecl '~TemplStruct'
+| `-CompoundStmt
+|-CXXMethodDecl 'foo'
+| `-CompoundStmt
+|-AccessSpecDecl
+`-FieldDecl 'm_t'
+)cpp");
+  }
+  {
+    auto BN = ast_matchers::match(
+        functionTemplateDecl(hasName("timesTwo")).bind("fn"),
+        AST->getASTContext());
+    EXPECT_EQ(BN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            BN[0].getNodeAs<Decl>("fn")),
+              R"cpp(
+FunctionTemplateDecl 'timesTwo'
+|-TemplateTypeParmDecl 'T'
+`-FunctionDecl 'timesTwo'
+  |-ParmVarDecl 'input'
+  `-CompoundStmt
+    `-ReturnStmt
+      `-BinaryOperator
+        |-DeclRefExpr 'input'
+        `-IntegerLiteral
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("fn")),
+              R"cpp(
+FunctionTemplateDecl 'timesTwo'
+|-TemplateTypeParmDecl 'T'
+|-FunctionDecl 'timesTwo'
+| |-ParmVarDecl 'input'
+| `-CompoundStmt
+|   `-ReturnStmt
+|     `-BinaryOperator
+|       |-DeclRefExpr 'input'
+|       `-IntegerLiteral
+|-FunctionDecl 'timesTwo'
+| |-TemplateArgument type int
+| | `-BuiltinType
+| |-ParmVarDecl 'input'
+| `-CompoundStmt
+|   `-ReturnStmt
+|     `-BinaryOperator
+|       |-ImplicitCastExpr
+|       | `-DeclRefExpr 'input'
+|       `-IntegerLiteral
+|-FunctionDecl 'timesTwo'
+| |-TemplateArgument type double
+| | `-BuiltinType
+| |-ParmVarDecl 'input'
+| `-CompoundStmt
+|   `-ReturnStmt
+|     `-BinaryOperator
+|       |-ImplicitCastExpr
+|       | `-DeclRefExpr 'input'
+|       `-ImplicitCastExpr
+|         `-IntegerLiteral
+|-FunctionDecl 'timesTwo'
+| |-TemplateArgument type float
+| | `-BuiltinType
+| |-ParmVarDecl 'input'
+| `-CompoundStmt
+|   `-ReturnStmt
+|     `-BinaryOperator
+|       |-ImplicitCastExpr
+|       | `-DeclRefExpr 'input'
+|       `-ImplicitCastExpr
+|         `-IntegerLiteral
+|-FunctionDecl 'timesTwo'
+| |-TemplateArgument type _Bool
+| | `-BuiltinType
+| |-ParmVarDecl ''
+| `-CompoundStmt
+|   `-ReturnStmt
+|     `-CXXBoolLiteralExpr
+`-FunctionDecl 'timesTwo'
+  |-TemplateArgument type _Bool
+  | `-BuiltinType
+  `-ParmVarDecl 'input'
+)cpp");
+  }
+  {
+    auto BN = ast_matchers::match(
+        classTemplateSpecializationDecl(
+            hasName("TemplStruct"),
+            hasTemplateArgument(
+                0, templateArgument(refersToType(asString("float")))),
+            hasParent(translationUnitDecl()))
+            .bind("rec"),
+        AST->getASTContext());
+    EXPECT_EQ(BN.size(), 1u);
+
+    EXPECT_EQ(dumpASTString(TK_IgnoreUnlessSpelledInSource,
+                            BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+ClassTemplateSpecializationDecl 'TemplStruct'
+`-TemplateArgument type float
+  `-BuiltinType
+)cpp");
+
+    EXPECT_EQ(dumpASTString(TK_AsIs, BN[0].getNodeAs<Decl>("rec")),
+              R"cpp(
+ClassTemplateSpecializationDecl 'TemplStruct'
+|-TemplateArgument type float
+| `-BuiltinType
+|-CXXRecordDecl 'TemplStruct'
+|-CXXConstructorDecl 'TemplStruct'
+| `-CompoundStmt
+|-CXXDestructorDecl '~TemplStruct'
+| `-CompoundStmt
+|-AccessSpecDecl
+`-FieldDecl 'm_t'
 )cpp");
   }
 }

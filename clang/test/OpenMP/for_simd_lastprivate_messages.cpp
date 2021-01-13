@@ -1,8 +1,8 @@
 // RUN: %clang_cc1 -verify=expected,omp45 -fopenmp-version=45 -fopenmp %s -Wuninitialized
-// RUN: %clang_cc1 -verify=expected,omp50 -fopenmp-version=50 -fopenmp %s -Wuninitialized
+// RUN: %clang_cc1 -verify=expected,omp50 -fopenmp %s -Wuninitialized
 
 // RUN: %clang_cc1 -verify=expected,omp45 -fopenmp-version=45 -fopenmp-simd %s -Wuninitialized
-// RUN: %clang_cc1 -verify=expected,omp50 -fopenmp-version=50 -fopenmp-simd %s -Wuninitialized
+// RUN: %clang_cc1 -verify=expected,omp50 -fopenmp-simd %s -Wuninitialized
 
 extern int omp_default_mem_alloc;
 void foo() {
@@ -108,6 +108,10 @@ int foomain(int argc, char **argv) {
     ++k;
 #pragma omp parallel
 #pragma omp for simd lastprivate(conditional: argc,s) lastprivate(conditional: // omp45-error 2 {{use of undeclared identifier 'conditional'}} omp50-error {{expected expression}} expected-error {{expected ')'}} expected-note {{to match this '('}} omp45-error 2 {{calling a private constructor of class 'S6'}} omp50-error {{expected list item of scalar type in 'lastprivate' clause with 'conditional' modifier}}
+  for (int k = 0; k < argc; ++k)
+    ++k;
+#pragma omp parallel
+#pragma omp for simd lastprivate(foo:argc) // omp50-error {{expected 'conditional' in OpenMP clause 'lastprivate'}} omp45-error {{expected ',' or ')' in 'lastprivate' clause}} omp45-error {{expected ')'}} omp45-error {{expected variable name}} omp45-note {{to match this '('}}
   for (int k = 0; k < argc; ++k)
     ++k;
 #pragma omp parallel

@@ -105,6 +105,7 @@ Parser::ParseStatementOrDeclaration(StmtVector &Stmts,
 
   StmtResult Res = ParseStatementOrDeclarationAfterAttributes(
       Stmts, StmtCtx, TrailingElseLoc, Attrs);
+  MaybeDestroyTemplateIds();
 
   assert((Attrs.empty() || Res.isInvalid() || Res.isUsable()) &&
          "attributes on empty statement");
@@ -214,11 +215,10 @@ Retry:
       DeclGroupPtrTy Decl;
       if (GNUAttributeLoc.isValid()) {
         DeclStart = GNUAttributeLoc;
-        Decl = ParseDeclaration(DeclaratorContext::BlockContext, DeclEnd, Attrs,
+        Decl = ParseDeclaration(DeclaratorContext::Block, DeclEnd, Attrs,
                                 &GNUAttributeLoc);
       } else {
-        Decl =
-            ParseDeclaration(DeclaratorContext::BlockContext, DeclEnd, Attrs);
+        Decl = ParseDeclaration(DeclaratorContext::Block, DeclEnd, Attrs);
       }
       if (Attrs.Range.getBegin().isValid())
         DeclStart = Attrs.Range.getBegin();
@@ -353,20 +353,33 @@ Retry:
 
   case tok::annot_pragma_fp_contract:
     ProhibitAttributes(Attrs);
-    Diag(Tok, diag::err_pragma_fp_contract_scope);
+    Diag(Tok, diag::err_pragma_file_or_compound_scope) << "fp_contract";
     ConsumeAnnotationToken();
     return StmtError();
 
   case tok::annot_pragma_fp:
     ProhibitAttributes(Attrs);
-    Diag(Tok, diag::err_pragma_fp_scope);
+    Diag(Tok, diag::err_pragma_file_or_compound_scope) << "clang fp";
     ConsumeAnnotationToken();
     return StmtError();
 
   case tok::annot_pragma_fenv_access:
     ProhibitAttributes(Attrs);
-    HandlePragmaFEnvAccess();
+    Diag(Tok, diag::err_pragma_stdc_fenv_access_scope);
+    ConsumeAnnotationToken();
     return StmtEmpty();
+
+  case tok::annot_pragma_fenv_round:
+    ProhibitAttributes(Attrs);
+    Diag(Tok, diag::err_pragma_file_or_compound_scope) << "STDC FENV_ROUND";
+    ConsumeAnnotationToken();
+    return StmtError();
+
+  case tok::annot_pragma_float_control:
+    ProhibitAttributes(Attrs);
+    Diag(Tok, diag::err_pragma_file_or_compound_scope) << "float_control";
+    ConsumeAnnotationToken();
+    return StmtError();
 
   case tok::annot_pragma_opencl_extension:
     ProhibitAttributes(Attrs);
@@ -936,6 +949,12 @@ void Parser::ParseCompoundStatementLeadingPragmas() {
     case tok::annot_pragma_fenv_access:
       HandlePragmaFEnvAccess();
       break;
+    case tok::annot_pragma_fenv_round:
+      HandlePragmaFEnvRound();
+      break;
+    case tok::annot_pragma_float_control:
+      HandlePragmaFloatControl();
+      break;
     case tok::annot_pragma_ms_pointers_to_members:
       HandlePragmaMSPointersToMembers();
       break;
@@ -1014,9 +1033,9 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
                                 Tok.getLocation(),
                                 "in compound statement ('{}')");
 
-  // Record the state of the FP_CONTRACT pragma, restore on leaving the
+  // Record the current FPFeatures, restore on leaving the
   // compound statement.
-  Sema::FPContractStateRAII SaveFPContractState(Actions);
+  Sema::FPFeaturesStateRAII SaveFPFeatures(Actions);
 
   InMessageExpressionRAIIObject InMessage(*this, false);
   BalancedDelimiterTracker T(*this, tok::l_brace);
@@ -1027,6 +1046,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
 
   // Parse any pragmas at the beginning of the compound statement.
   ParseCompoundStatementLeadingPragmas();
+  Actions.ActOnAfterCompoundStatementLeadingPragmas();
 
   StmtVector Stmts;
 
@@ -1098,7 +1118,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
 
         SourceLocation DeclStart = Tok.getLocation(), DeclEnd;
         DeclGroupPtrTy Res =
-            ParseDeclaration(DeclaratorContext::BlockContext, DeclEnd, attrs);
+            ParseDeclaration(DeclaratorContext::Block, DeclEnd, attrs);
         R = Actions.ActOnDeclStmt(Res, DeclStart, DeclEnd);
       } else {
         // Otherwise this was a unary __extension__ marker.
@@ -1125,9 +1145,17 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
   SourceLocation CloseLoc = Tok.getLocation();
 
   // We broke out of the while loop because we found a '}' or EOF.
-  if (!T.consumeClose())
+  if (!T.consumeClose()) {
+    // If this is the '})' of a statement expression, check that it's written
+    // in a sensible way.
+    if (isStmtExpr && Tok.is(tok::r_paren))
+      checkCompoundToken(CloseLoc, tok::r_brace, CompoundToken::StmtExprEnd);
+  } else {
     // Recover by creating a compound statement with what we parsed so far,
-    // instead of dropping everything and returning StmtError();
+    // instead of dropping everything and returning StmtError().
+  }
+
+  if (T.getCloseLocation().isValid())
     CloseLoc = T.getCloseLocation();
 
   return Actions.ActOnCompoundStmt(T.getOpenLocation(), CloseLoc,
@@ -1146,10 +1174,14 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
 /// should try to recover harder.  It returns false if the condition is
 /// successfully parsed.  Note that a successful parse can still have semantic
 /// errors in the condition.
+/// Additionally, if LParenLoc and RParenLoc are non-null, it will assign
+/// the location of the outer-most '(' and ')', respectively, to them.
 bool Parser::ParseParenExprOrCondition(StmtResult *InitStmt,
                                        Sema::ConditionResult &Cond,
                                        SourceLocation Loc,
-                                       Sema::ConditionKind CK) {
+                                       Sema::ConditionKind CK,
+                                       SourceLocation *LParenLoc,
+                                       SourceLocation *RParenLoc) {
   BalancedDelimiterTracker T(*this, tok::l_paren);
   T.consumeOpen();
 
@@ -1178,6 +1210,13 @@ bool Parser::ParseParenExprOrCondition(StmtResult *InitStmt,
 
   // Otherwise the condition is valid or the rparen is present.
   T.consumeClose();
+
+  if (LParenLoc != nullptr) {
+    *LParenLoc = T.getOpenLocation();
+  }
+  if (RParenLoc != nullptr) {
+    *RParenLoc = T.getCloseLocation();
+  }
 
   // Check for extraneous ')'s to catch things like "if (foo())) {".  We know
   // that all callers are looking for a statement after the condition, so ")"
@@ -1214,6 +1253,42 @@ struct MisleadingIndentationChecker {
     if (Kind == MSK_else && !ShouldSkip)
       P.MisleadingIndentationElseLoc = SL;
   }
+
+  /// Compute the column number will aligning tabs on TabStop (-ftabstop), this
+  /// gives the visual indentation of the SourceLocation.
+  static unsigned getVisualIndentation(SourceManager &SM, SourceLocation Loc) {
+    unsigned TabStop = SM.getDiagnostics().getDiagnosticOptions().TabStop;
+
+    unsigned ColNo = SM.getSpellingColumnNumber(Loc);
+    if (ColNo == 0 || TabStop == 1)
+      return ColNo;
+
+    std::pair<FileID, unsigned> FIDAndOffset = SM.getDecomposedLoc(Loc);
+
+    bool Invalid;
+    StringRef BufData = SM.getBufferData(FIDAndOffset.first, &Invalid);
+    if (Invalid)
+      return 0;
+
+    const char *EndPos = BufData.data() + FIDAndOffset.second;
+    // FileOffset are 0-based and Column numbers are 1-based
+    assert(FIDAndOffset.second + 1 >= ColNo &&
+           "Column number smaller than file offset?");
+
+    unsigned VisualColumn = 0; // Stored as 0-based column, here.
+    // Loop from beginning of line up to Loc's file position, counting columns,
+    // expanding tabs.
+    for (const char *CurPos = EndPos - (ColNo - 1); CurPos != EndPos;
+         ++CurPos) {
+      if (*CurPos == '\t')
+        // Advance visual column to next tabstop.
+        VisualColumn += (TabStop - VisualColumn % TabStop);
+      else
+        VisualColumn++;
+    }
+    return VisualColumn + 1;
+  }
+
   void Check() {
     Token Tok = P.getCurToken();
     if (P.getActions().getDiagnostics().isIgnored(
@@ -1230,16 +1305,18 @@ struct MisleadingIndentationChecker {
       P.MisleadingIndentationElseLoc = SourceLocation();
 
     SourceManager &SM = P.getPreprocessor().getSourceManager();
-    unsigned PrevColNum = SM.getSpellingColumnNumber(PrevLoc);
-    unsigned CurColNum = SM.getSpellingColumnNumber(Tok.getLocation());
-    unsigned StmtColNum = SM.getSpellingColumnNumber(StmtLoc);
+    unsigned PrevColNum = getVisualIndentation(SM, PrevLoc);
+    unsigned CurColNum = getVisualIndentation(SM, Tok.getLocation());
+    unsigned StmtColNum = getVisualIndentation(SM, StmtLoc);
 
     if (PrevColNum != 0 && CurColNum != 0 && StmtColNum != 0 &&
         ((PrevColNum > StmtColNum && PrevColNum == CurColNum) ||
-         !Tok.isAtStartOfLine()) && SM.getPresumedLineNumber(StmtLoc) !=
-          SM.getPresumedLineNumber(Tok.getLocation())) {
-      P.Diag(Tok.getLocation(), diag::warn_misleading_indentation)
-          << Kind;
+         !Tok.isAtStartOfLine()) &&
+        SM.getPresumedLineNumber(StmtLoc) !=
+            SM.getPresumedLineNumber(Tok.getLocation()) &&
+        (Tok.isNot(tok::identifier) ||
+         P.getPreprocessor().LookAhead(0).isNot(tok::colon))) {
+      P.Diag(Tok.getLocation(), diag::warn_misleading_indentation) << Kind;
       P.Diag(StmtLoc, diag::note_previous_statement);
     }
   }
@@ -1291,14 +1368,19 @@ StmtResult Parser::ParseIfStatement(SourceLocation *TrailingElseLoc) {
   // Parse the condition.
   StmtResult InitStmt;
   Sema::ConditionResult Cond;
+  SourceLocation LParen;
+  SourceLocation RParen;
   if (ParseParenExprOrCondition(&InitStmt, Cond, IfLoc,
                                 IsConstexpr ? Sema::ConditionKind::ConstexprIf
-                                            : Sema::ConditionKind::Boolean))
+                                            : Sema::ConditionKind::Boolean,
+                                &LParen, &RParen))
     return StmtError();
 
   llvm::Optional<bool> ConstexprCondition;
   if (IsConstexpr)
     ConstexprCondition = Cond.getKnownValue();
+
+  bool IsBracedThen = Tok.is(tok::l_brace);
 
   // C99 6.8.4p3 - In C99, the body of the if statement is a scope, even if
   // there is no compound stmt.  C90 does not have this clause.  We only do this
@@ -1318,7 +1400,7 @@ StmtResult Parser::ParseIfStatement(SourceLocation *TrailingElseLoc) {
   //    would have to notify ParseStatement not to create a new scope. It's
   //    simpler to let it create a new scope.
   //
-  ParseScope InnerScope(this, Scope::DeclScope, C99orCXX, Tok.is(tok::l_brace));
+  ParseScope InnerScope(this, Scope::DeclScope, C99orCXX, IsBracedThen);
 
   MisleadingIndentationChecker MIChecker(*this, MSK_if, IfLoc);
 
@@ -1379,7 +1461,7 @@ StmtResult Parser::ParseIfStatement(SourceLocation *TrailingElseLoc) {
     // Pop the 'else' scope if needed.
     InnerScope.Exit();
   } else if (Tok.is(tok::code_completion)) {
-    Actions.CodeCompleteAfterIf(getCurScope());
+    Actions.CodeCompleteAfterIf(getCurScope(), IsBracedThen);
     cutOffParsing();
     return StmtError();
   } else if (InnerStatementTrailingElseLoc.isValid()) {
@@ -1404,8 +1486,8 @@ StmtResult Parser::ParseIfStatement(SourceLocation *TrailingElseLoc) {
   if (ElseStmt.isInvalid())
     ElseStmt = Actions.ActOnNullStmt(ElseStmtLoc);
 
-  return Actions.ActOnIfStmt(IfLoc, IsConstexpr, InitStmt.get(), Cond,
-                             ThenStmt.get(), ElseLoc, ElseStmt.get());
+  return Actions.ActOnIfStmt(IfLoc, IsConstexpr, LParen, InitStmt.get(), Cond,
+                             RParen, ThenStmt.get(), ElseLoc, ElseStmt.get());
 }
 
 /// ParseSwitchStatement
@@ -1444,12 +1526,14 @@ StmtResult Parser::ParseSwitchStatement(SourceLocation *TrailingElseLoc) {
   // Parse the condition.
   StmtResult InitStmt;
   Sema::ConditionResult Cond;
+  SourceLocation LParen;
+  SourceLocation RParen;
   if (ParseParenExprOrCondition(&InitStmt, Cond, SwitchLoc,
-                                Sema::ConditionKind::Switch))
+                                Sema::ConditionKind::Switch, &LParen, &RParen))
     return StmtError();
 
-  StmtResult Switch =
-      Actions.ActOnStartOfSwitchStmt(SwitchLoc, InitStmt.get(), Cond);
+  StmtResult Switch = Actions.ActOnStartOfSwitchStmt(
+      SwitchLoc, LParen, InitStmt.get(), Cond, RParen);
 
   if (Switch.isInvalid()) {
     // Skip the switch body.
@@ -1532,8 +1616,10 @@ StmtResult Parser::ParseWhileStatement(SourceLocation *TrailingElseLoc) {
 
   // Parse the condition.
   Sema::ConditionResult Cond;
+  SourceLocation LParen;
+  SourceLocation RParen;
   if (ParseParenExprOrCondition(nullptr, Cond, WhileLoc,
-                                Sema::ConditionKind::Boolean))
+                                Sema::ConditionKind::Boolean, &LParen, &RParen))
     return StmtError();
 
   // C99 6.8.5p5 - In C99, the body of the while statement is a scope, even if
@@ -1563,7 +1649,7 @@ StmtResult Parser::ParseWhileStatement(SourceLocation *TrailingElseLoc) {
   if (Cond.isInvalid() || Body.isInvalid())
     return StmtError();
 
-  return Actions.ActOnWhileStmt(WhileLoc, Cond, Body.get());
+  return Actions.ActOnWhileStmt(WhileLoc, LParen, Cond, RParen, Body.get());
 }
 
 /// ParseDoStatement
@@ -1785,7 +1871,7 @@ StmtResult Parser::ParseForStatement(SourceLocation *TrailingElseLoc) {
 
     SourceLocation DeclStart = Tok.getLocation(), DeclEnd;
     DeclGroupPtrTy DG = ParseSimpleDeclaration(
-        DeclaratorContext::ForContext, DeclEnd, attrs, false,
+        DeclaratorContext::ForInit, DeclEnd, attrs, false,
         MightBeForRangeStmt ? &ForRangeInfo : nullptr);
     FirstPart = Actions.ActOnDeclStmt(DG, DeclStart, Tok.getLocation());
     if (ForRangeInfo.ParsedForRangeDecl()) {
@@ -1883,7 +1969,7 @@ StmtResult Parser::ParseForStatement(SourceLocation *TrailingElseLoc) {
         if (ForRangeInfo.ParsedForRangeDecl()) {
           Diag(FirstPart.get() ? FirstPart.get()->getBeginLoc()
                                : ForRangeInfo.ColonLoc,
-               getLangOpts().CPlusPlus2a
+               getLangOpts().CPlusPlus20
                    ? diag::warn_cxx17_compat_for_range_init_stmt
                    : diag::ext_for_range_init_stmt)
               << (FirstPart.get() ? FirstPart.get()->getSourceRange()
@@ -2124,6 +2210,8 @@ StmtResult Parser::ParsePragmaLoopHint(StmtVector &Stmts,
   // Create temporary attribute list.
   ParsedAttributesWithRange TempAttrs(AttrFactory);
 
+  SourceLocation StartLoc = Tok.getLocation();
+
   // Get loop hints and consume annotated token.
   while (Tok.is(tok::annot_pragma_loop_hint)) {
     LoopHint Hint;
@@ -2144,6 +2232,12 @@ StmtResult Parser::ParsePragmaLoopHint(StmtVector &Stmts,
       Stmts, StmtCtx, TrailingElseLoc, Attrs);
 
   Attrs.takeAllFrom(TempAttrs);
+
+  // Start of attribute range may already be set for some invalid input.
+  // See PR46336.
+  if (Attrs.Range.getBegin().isInvalid())
+    Attrs.Range.setBegin(StartLoc);
+
   return S;
 }
 
@@ -2376,7 +2470,7 @@ StmtResult Parser::ParseCXXCatchBlock(bool FnCatch) {
     if (ParseCXXTypeSpecifierSeq(DS))
       return StmtError();
 
-    Declarator ExDecl(DS, DeclaratorContext::CXXCatchContext);
+    Declarator ExDecl(DS, DeclaratorContext::CXXCatch);
     ParseDeclarator(ExDecl);
     ExceptionDecl = Actions.ActOnExceptionDeclarator(getCurScope(), ExDecl);
   } else

@@ -7,22 +7,22 @@
 declare i32 @target_func()
 
 
-; Test that Control Flow Guard checks are not added to functions with nocf_checks attribute.
-define i32 @func_nocf_checks() #0 {
+; Test that Control Flow Guard checks are not added on calls with the "guard_nocf" attribute.
+define i32 @func_guard_nocf() {
 entry:
   %func_ptr = alloca i32 ()*, align 8
   store i32 ()* @target_func, i32 ()** %func_ptr, align 8
   %0 = load i32 ()*, i32 ()** %func_ptr, align 8
-  %1 = call i32 %0()
+  %1 = call i32 %0() #0
   ret i32 %1
 
-  ; CHECK-LABEL: func_nocf_checks
+  ; CHECK-LABEL: func_guard_nocf
   ; CHECK:       adrp x8, target_func
 	; CHECK:       add x8, x8, target_func
   ; CHECK-NOT:   __guard_check_icall_fptr
 	; CHECK:       blr x8
 }
-attributes #0 = { nocf_check }
+attributes #0 = { "guard_nocf" }
 
 
 ; Test that Control Flow Guard checks are added even at -O0.
@@ -36,10 +36,10 @@ entry:
 
   ; The call to __guard_check_icall_fptr should come immediately before the call to the target function.
   ; CHECK-LABEL: func_optnone_cf
-	; CHECK:        adrp x8, __guard_check_icall_fptr
-	; CHECK:        add x9, x8, __guard_check_icall_fptr
 	; CHECK:        adrp x8, target_func
 	; CHECK:        add x8, x8, target_func
+	; CHECK:        adrp x9, __guard_check_icall_fptr
+	; CHECK:        add x9, x9, __guard_check_icall_fptr
 	; CHECK:        ldr x9, [x9]
 	; CHECK:        mov x15, x8
 	; CHECK:        blr x9

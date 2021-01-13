@@ -39,7 +39,7 @@
 #include "llvm/MC/MCObjectFileInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSubtargetInfo.h"
-#include "llvm/MC/MCTargetOptionsCommandFlags.inc"
+#include "llvm/MC/MCTargetOptionsCommandFlags.h"
 #include "llvm/MCA/CodeEmitter.h"
 #include "llvm/MCA/Context.h"
 #include "llvm/MCA/InstrBuilder.h"
@@ -61,6 +61,8 @@
 #include "llvm/Support/WithColor.h"
 
 using namespace llvm;
+
+static mc::RegisterMCTargetOptionsFlags MOF;
 
 static cl::OptionCategory ToolOptions("Tool Options");
 static cl::OptionCategory ViewOptions("View Options");
@@ -323,11 +325,12 @@ int main(int argc, char **argv) {
   // Apply overrides to llvm-mca specific options.
   processViewOptions();
 
-  if (!MCPU.compare("native"))
-    MCPU = llvm::sys::getHostCPUName();
+  if (MCPU == "native")
+    MCPU = std::string(llvm::sys::getHostCPUName());
 
   std::unique_ptr<MCSubtargetInfo> STI(
       TheTarget->createMCSubtargetInfo(TripleName, MCPU, MATTR));
+  assert(STI && "Unable to create subtarget info!");
   if (!STI->isCPUStringValid(MCPU))
     return 1;
 
@@ -353,7 +356,7 @@ int main(int argc, char **argv) {
   std::unique_ptr<MCRegisterInfo> MRI(TheTarget->createMCRegInfo(TripleName));
   assert(MRI && "Unable to create target register info!");
 
-  MCTargetOptions MCOptions = InitMCTargetOptionsFromFlags();
+  MCTargetOptions MCOptions = mc::InitMCTargetOptionsFromFlags();
   std::unique_ptr<MCAsmInfo> MAI(
       TheTarget->createMCAsmInfo(*MRI, TripleName, MCOptions));
   assert(MAI && "Unable to create target asm info!");
@@ -371,6 +374,7 @@ int main(int argc, char **argv) {
   std::unique_ptr<buffer_ostream> BOS;
 
   std::unique_ptr<MCInstrInfo> MCII(TheTarget->createMCInstrInfo());
+  assert(MCII && "Unable to create instruction info!");
 
   std::unique_ptr<MCInstrAnalysis> MCIA(
       TheTarget->createMCInstrAnalysis(MCII.get()));
@@ -441,9 +445,11 @@ int main(int argc, char **argv) {
 
   std::unique_ptr<MCCodeEmitter> MCE(
       TheTarget->createMCCodeEmitter(*MCII, *MRI, Ctx));
+  assert(MCE && "Unable to create code emitter!");
 
   std::unique_ptr<MCAsmBackend> MAB(TheTarget->createMCAsmBackend(
-      *STI, *MRI, InitMCTargetOptionsFromFlags()));
+      *STI, *MRI, mc::InitMCTargetOptionsFromFlags()));
+  assert(MAB && "Unable to create asm backend!");
 
   for (const std::unique_ptr<mca::CodeRegion> &Region : Regions) {
     // Skip empty code regions.
@@ -474,7 +480,7 @@ int main(int argc, char **argv) {
                   std::string InstructionStr;
                   raw_string_ostream SS(InstructionStr);
                   WithColor::error() << IE.Message << '\n';
-                  IP->printInst(&IE.Inst, SS, "", *STI);
+                  IP->printInst(&IE.Inst, 0, "", *STI, SS);
                   SS.flush();
                   WithColor::note()
                       << "instruction: " << InstructionStr << '\n';
