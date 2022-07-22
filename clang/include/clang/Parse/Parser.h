@@ -32,6 +32,7 @@
 
 namespace clang {
   class PragmaHandler;
+  class SyntaxHandler;
   class Scope;
   class BalancedDelimiterTracker;
   class CorrectionCandidateCallback;
@@ -433,6 +434,9 @@ class Parser : public CodeCompletionHandler {
   /// a statement expression and builds a suitable expression statement.
   StmtResult handleExprStmt(ExprResult E, ParsedStmtContext StmtCtx);
 
+  /// The map of custom syntax handlers from plugins.
+  llvm::StringMap<std::unique_ptr<SyntaxHandler>> SyntaxHandlers;
+
 public:
   Parser(Preprocessor &PP, Sema &Actions, bool SkipFunctionBodies);
   ~Parser() override;
@@ -467,6 +471,10 @@ public:
   /// Initialize - Warm up the parser.
   ///
   void Initialize();
+
+  /// Add to the string of predefines in the preprocessor from the registered
+  //syntax plugins.
+  void AddPluginPredefines();
 
   /// Parse the first top-level declaration in a translation unit.
   bool ParseFirstTopLevelDecl(DeclGroupPtrTy &Result,
@@ -1603,6 +1611,7 @@ private:
                                                 AccessSpecifier AS);
 
   void SkipFunctionBody();
+  void ProcessPluginSyntax(ParsingDeclarator &D);
   Decl *ParseFunctionDefinition(ParsingDeclarator &D,
                  const ParsedTemplateInfo &TemplateInfo = ParsedTemplateInfo(),
                  LateParsedAttrList *LateParsedAttrs = nullptr);
@@ -3499,6 +3508,27 @@ private:
   GNUAsmQualifiers::AQ getGNUAsmQualifier(const Token &Tok) const;
   bool parseGNUAsmQualifierListOpt(GNUAsmQualifiers &AQ);
 };
+
+  class SyntaxHandler {
+    std::string Name;
+
+    virtual void anchor();
+  public:
+    SyntaxHandler() = default;
+    explicit SyntaxHandler(StringRef name) : Name(name) {}
+    virtual ~SyntaxHandler() = default;
+
+    StringRef getName() const { return Name; }
+    virtual void GetReplacement(Preprocessor &PP, Declarator &D,
+                                CachedTokens &Toks,
+                                llvm::raw_string_ostream &OS) = 0;
+    virtual void AddToPredefines(llvm::raw_string_ostream &OS) = 0;
+    /// Utility function returns actual text of a declarator.
+    StringRef getDeclText(Preprocessor &PP,Declarator &D);
+  };
+
+/// Registry of syntax handlers added by plugins
+  using SyntaxHandlerRegistry = llvm::Registry<SyntaxHandler>;
 
 }  // end namespace clang
 

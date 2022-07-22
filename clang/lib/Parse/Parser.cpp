@@ -23,6 +23,17 @@
 #include "llvm/Support/Path.h"
 using namespace clang;
 
+LLVM_INSTANTIATE_REGISTRY(SyntaxHandlerRegistry)
+
+void SyntaxHandler::anchor() {}
+// Utility function returning actual text for a declarator.
+llvm::StringRef SyntaxHandler::getDeclText(Preprocessor &PP,Declarator &D){
+  auto DeclCharRange = Lexer::getAsCharRange (D.getSourceRange(),
+                                              PP.getSourceManager(), PP.getLangOpts());
+  auto DeclText= Lexer::getSourceText (DeclCharRange,
+                                             PP.getSourceManager(), PP.getLangOpts());
+  return DeclText;
+}
 
 namespace {
 /// A comment handler that passes comments found by the preprocessor
@@ -68,6 +79,14 @@ Parser::Parser(Preprocessor &pp, Sema &actions, bool skipFunctionBodies)
   PP.addCommentHandler(CommentSemaHandler.get());
 
   PP.setCodeCompletionHandler(*this);
+
+  // Register syntax handlers from any loaded plugins.
+  for (SyntaxHandlerRegistry::iterator it = SyntaxHandlerRegistry::begin(),
+               ie = SyntaxHandlerRegistry::end();
+       it != ie; ++it) {
+          SyntaxHandler *Handler = it->instantiate().release();
+          SyntaxHandlers[Handler->getName()].reset(Handler);
+  }
 }
 
 DiagnosticBuilder Parser::Diag(SourceLocation Loc, unsigned DiagID) {
@@ -1194,6 +1213,108 @@ Parser::DeclGroupPtrTy Parser::ParseDeclarationOrFunctionDefinition(
   }
 }
 
+void Parser::AddPluginPredefines() {
+  if (SyntaxHandlers.empty())
+    return;
+
+  // Note: This must be called before Preprocessor::EnterMainSourceFile() is
+  // called.
+
+  std::string Predefines = PP.getPredefines();
+  llvm::raw_string_ostream PredefinesOS(Predefines);
+
+  for (auto &SH : SyntaxHandlers)
+    SH.getValue()->AddToPredefines(PredefinesOS);
+
+  PredefinesOS.flush();
+  PP.setPredefines(Predefines);
+}
+
+void Parser::ProcessPluginSyntax(ParsingDeclarator &D) {
+  assert(Tok.isNot(tok::equal) && "Processing plugin syntax without body?");
+
+  // If this function's body should be handled (replaced) by a plugin, arrange
+  // for that now.
+
+  const ParsedAttr *SyntaxPA = nullptr;
+
+  auto SynName = [&SyntaxPA]() {
+    return SyntaxPA->getArgAsIdent(0)->Ident->getName();
+  };
+
+  for (const ParsedAttr &AL : D.getDeclSpec().getAttributes()) {
+    if (AL.getKind() == ParsedAttr::AT_Syntax) {
+      if (SyntaxPA &&
+          AL.getArgAsIdent(0)->Ident->getName() != SynName()) {
+        Diag(AL.getLoc(), diag::err_duplicate_syntax_plugin_attribute) << AL;
+        continue;
+      }
+
+      SyntaxPA = &AL;
+    }
+  }
+
+  if (!SyntaxPA)
+    return;
+
+  const auto &SHI = SyntaxHandlers.find(SynName());
+  if (SHI == SyntaxHandlers.end()) {
+    Diag(SyntaxPA->getLoc(),
+         diag::err_attribute_syntax_plugin_not_found) << SynName();
+    return;
+  }
+
+  ConsumeBrace();
+
+  // Collect the token stream until the closing right brace (but leave the
+  // closing right brace so that we can use it to indicate the end of the
+  // replacement function body).
+
+  CachedTokens Toks;
+  if (!ConsumeAndStoreUntil(tok::r_brace, Toks, /*StopAtSemi=*/false,
+                            /*ConsumeFinalToken*/false)) {
+    return;
+  }
+
+
+  std::string Replacement;
+  llvm::raw_string_ostream ReplacementOS(Replacement);
+  ReplacementOS << "\n{\n";
+  // Place __builtin_unreachable(); in the forgoten function. This
+  // is done to avoid warnings from the compiler.
+  ReplacementOS << "__builtin_unreachable();\n";
+  ReplacementOS << "\n}\n";
+
+  // Provide the token stream to the plugin and get back the replacement text.
+  SHI->second->GetReplacement(PP, D, Toks, ReplacementOS);
+  ReplacementOS.flush();
+
+  // Change the identifier name in the declarator to forget
+  // the original function.
+
+  std::string NewName;
+  NewName ="__"+ D.getIdentifier()->getName().str();
+
+  IdentifierInfo &VariantII = Actions.Context.Idents.get(NewName);
+  D.SetIdentifier(&VariantII, D.getBeginLoc());
+
+  // Now we have a replacement text buffer from the plugin, enter it for
+  // lexing. After we're done with that, we'll resume parsing the original
+  // source with the closing right brace.
+
+  std::unique_ptr<llvm::MemoryBuffer> SB =
+    llvm::MemoryBuffer::getMemBufferCopy(Replacement, "<built-in>");
+  FileID FID = PP.getSourceManager().createFileID(std::move(SB));
+  assert(FID.isValid() &&
+         "Could not create FileID for plugin replacement text?");
+
+  PP.EnterSourceFile(FID, nullptr, SourceLocation());
+
+  // Discard the previously-read next token and read the token from the
+  // replacement stream.
+  ConsumeAnyToken();
+}
+
 /// ParseFunctionDefinition - We parsed and verified that the specified
 /// Declarator is well formed.  If this is a K&R-style function, read the
 /// parameters declaration-list, then start the compound-statement.
@@ -1260,6 +1381,8 @@ Decl *Parser::ParseFunctionDefinition(ParsingDeclarator &D,
     for (const ParsedAttr &AL : D.getAttributes())
       if (AL.isKnownToGCC() && !AL.isStandardAttributeSyntax())
         Diag(AL.getLoc(), diag::warn_attribute_on_function_definition) << AL;
+
+    ProcessPluginSyntax(D);
   }
 
   // In delayed template parsing mode, for function template we consume the

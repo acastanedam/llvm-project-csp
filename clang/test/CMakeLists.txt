@@ -72,7 +72,7 @@ list(APPEND CLANG_TEST_DEPS
   diagtool
   hmaptool
   )
-  
+
 if(CLANG_ENABLE_STATIC_ANALYZER)
   list(APPEND CLANG_TEST_DEPS
     clang-check
@@ -94,6 +94,7 @@ if(CLANG_BUILD_EXAMPLES AND CLANG_PLUGIN_SUPPORT)
     CallSuperAttr
     PluginsOrder
     PrintFunctionNames
+    PrintTokensSyntax
     )
 endif ()
 
